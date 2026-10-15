@@ -1,0 +1,14 @@
+# Dữ liệu và cấu hình phát sinh khi chạy ứng dụng
+Videos/
+ZaloExports/
+logs/
+*.db
+*.db-*
+packstation-config.json
+config.json
+*.log
+
+# Tập tin tạm
+__pycache__/
+*.tmp
+*.tmp.mp4

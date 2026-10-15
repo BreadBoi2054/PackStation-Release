@@ -12,6 +12,6 @@
 
 Nút **Xuất gửi Zalo** trong trang tra cứu đơn tạo bản H.264 ở thư mục `ZaloExports` mà không thay đổi video gốc.
 
-Từ bản v1.5.1, app hiển thị cảnh báo khi camera/ghi hình gặp lỗi và kiểm tra nhanh video sau khi kết thúc đơn. Video được ghi theo nhịp 5 khung hình/giây để phù hợp máy xưởng cấu hình yếu.
+Từ bản v1.5.2, app hiển thị cảnh báo khi camera/ghi hình gặp lỗi và kiểm tra nhanh video sau khi kết thúc đơn. Video được ghi theo nhịp 5 khung hình/giây để phù hợp máy xưởng cấu hình yếu.
 
 Hướng dẫn PDF cũ đã được gỡ khỏi bản phát hành vì không còn khớp với giao diện hiện tại.

@@ -4,7 +4,7 @@
 
 ## Sử dụng
 
-1. Tải toàn bộ repo dưới dạng ZIP và giải nén, hoặc clone repo.
+1. Mở mục **Releases** trên GitHub và tải file ZIP của phiên bản mới nhất.
 2. Giữ nguyên cấu trúc thư mục, đặc biệt là `_internal`.
 3. Chạy `PackStation.exe`.
 
@@ -12,4 +12,4 @@
 
 Nút **Xuất gửi Zalo** trong trang tra cứu đơn tạo bản H.264 ở thư mục `ZaloExports` mà không thay đổi video gốc.
 
-Xem `Huong_Dan_Su_Dung_PackStation.pdf` để biết cách sử dụng.
+Hướng dẫn PDF cũ đã được gỡ khỏi bản phát hành vì không còn khớp với giao diện hiện tại.

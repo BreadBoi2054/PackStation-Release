@@ -1,0 +1,43 @@
+{
+  "language": "vi-VN",
+  "app_name": "PackStation",
+  "video_dir": ".\\Videos",
+  "max_stations": 4,
+  "active_stations": 1,
+  "auto_record": true,
+  "video_retention_days": 30,
+  "duplicate_cooldown_seconds": 60,
+  "sound_enabled": true,
+  "sound_volume": 80,
+  "auto_scan_enabled": true,
+  "auto_scan_interval_ms": 500,
+  "startup_with_windows": false,
+  "pin_code": "",
+  "pin_protected_features": [],
+  "stations": {
+    "1": {
+      "name": "Bàn 1",
+      "camera_source": "",
+      "camera_source_2": "",
+      "camera_type": "rtsp",
+      "scanner_port": "",
+      "scanner_baudrate": 9600,
+      "cameras": [
+        "",
+        ""
+      ],
+      "camera_source_3": ""
+    }
+  },
+  "function_codes": {
+    "end_order": "END",
+    "cancel_order": "CANCEL",
+    "manual_order": "MANUAL",
+    "set_shift": "SHIFT"
+  },
+  "end_code_prefix": "KETTHUC",
+  "cancel_code_prefix": "HUYDON",
+  "manual_code_prefix": "DONTHUCONG",
+  "shift_code_prefix": "SETCA",
+  "current_shift": ""
+}

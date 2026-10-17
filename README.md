@@ -1,17 +1,84 @@
-# PackStation — bản chạy Windows
+# 📦 PackStation
 
-Đây là bản PackStation đã đóng gói để chạy trên Windows. Không cần cài Python.
+Phần mềm quản lý đóng gói hàng hóa + Camera RTSP giám sát — chuyên dụng cho xưởng e-commerce (Shopee, Lazada, Tiki).
 
-## Sử dụng
+## Tính năng
 
-1. Mở mục **Releases** trên GitHub và tải file ZIP của phiên bản mới nhất.
-2. Giữ nguyên cấu trúc thư mục, đặc biệt là `_internal`.
-3. Chạy `PackStation.exe`.
+- 📷 **Camera RTSP dual-lens** — hỗ trợ Imou/Dahua IPC-S2XEP-10M0S
+- 🔍 **Quét QR/Barcode tự động** — 3 tầng fallback (pyzbar → OpenCV)
+- 🔴 **Quay video bằng chứng** — tự tách 2 file Cam1/Cam2, timestamp watermark
+- 📊 **Báo cáo Excel** — thống kê theo ngày, ca làm việc
+- 🔐 **Bảo mật** — Mã PIN quản lý (SHA-256) bảo vệ Cài đặt hệ thống, ẩn/mask mật khẩu RTSP camera
+- 💻 **Portable** — cắm USB là chạy, không cần cài đặt
+- 🧠 **Tối ưu máy yếu** — adaptive FPS, chạy tốt trên i3 Gen 5
 
-Ứng dụng sẽ tạo cấu hình, cơ sở dữ liệu, nhật ký và thư mục video trên máy sử dụng. Các dữ liệu này không thuộc bản phát hành và không nên đẩy lên GitHub.
+## Cấu trúc
 
-Nút **Xuất gửi Zalo** trong trang tra cứu đơn tạo bản H.264 ở thư mục `ZaloExports` mà không thay đổi video gốc.
+```
+PackStation/
+├── main.py                  # Entry point
+├── config.py                # Config management (JSON)
+├── database.py              # SQLite WAL database
+├── i18n.py                  # Internationalization
+├── build.py                 # PyInstaller build script
+├── core/
+│   ├── camera_manager.py    # RTSP camera streams (OpenCV)
+│   ├── barcode_scanner.py   # QR/Barcode scanner (pyzbar)
+│   ├── video_recorder.py    # Async video recording
+│   ├── order_manager.py     # Order lifecycle management
+│   ├── audio_manager.py     # Sound alerts (winsound)
+│   ├── startup_manager.py   # Windows auto-start (Registry)
+│   ├── dahua_sdk.py         # Dahua/Imou NetSDK integration
+│   ├── camera_discovery.py  # ONVIF camera discovery
+│   └── logger.py            # Centralized file logging
+├── ui/
+│   ├── app_window.py        # Main UI (CustomTkinter)
+│   └── theme.py             # Color/font design tokens
+├── i18n/
+│   └── vi-VN.json           # Vietnamese translations
+├── tests/
+│   └── test_deep_validation.py  # Integration test suite
+└── assets/
+    ├── icon.ico
+    └── logo.png
+```
 
-Từ bản v1.5.2, app hiển thị cảnh báo khi camera/ghi hình gặp lỗi và kiểm tra nhanh video sau khi kết thúc đơn. Từ bản v1.5.3, video được ghi theo nhịp 10 khung hình/giây trực tiếp từ luồng camera, độc lập với tốc độ hiển thị giao diện.
+## Yêu cầu phát triển
 
-Hướng dẫn PDF cũ đã được gỡ khỏi bản phát hành vì không còn khớp với giao diện hiện tại.
+```bash
+pip install -r requirements.txt
+```
+
+**Python 3.12+** | Dependencies: `customtkinter`, `opencv-python`, `pyzbar`, `Pillow`, `openpyxl`, `numpy`
+
+## Chạy
+
+```bash
+python main.py
+```
+
+## Build Portable
+
+```bash
+python build.py
+```
+
+Output: `dist/PackStation/` → copy vào `C:\PackStation`
+
+## Test
+
+```bash
+python tests/test_deep_validation.py
+```
+
+## Camera hỗ trợ
+
+| Model | Resolution | Dual-lens | Tested |
+|:---|:---:|:---:|:---:|
+| Imou IPC-S2XEP-10M0S | 2K (2304×1296) | ✅ | ✅ |
+| Dahua IPC-HDW series | 1080p-4K | ❌ | ✅ |
+| ONVIF compatible | Any | ❌ | ⚠️ |
+
+## License
+
+Copyright (c) 2024-2026 BA DUY. All rights reserved.

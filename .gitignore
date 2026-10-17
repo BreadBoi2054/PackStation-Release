@@ -1,0 +1,50 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# PyInstaller / Build artifacts
+build/
+dist/
+*.spec.bak
+
+# Logs
+logs/
+*.log
+
+# Video recordings (Sensitive customer/order packaging data)
+Videos/
+videos/
+*.mp4
+*.avi
+*.mkv
+
+# SQLite Databases & WAL/SHM files
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# Local runtime & sensitive configuration
+packstation-config.json
+config_test.json
+
+# Virtual environments
+venv/
+env/
+.venv/
+ENV/
+
+# IDE / Editor folders
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.swp
+
+# Test artifacts
+tmp_test_env/
+.pytest_cache/

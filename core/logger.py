@@ -50,7 +50,7 @@ def get_logger(log_dir: str = None) -> logging.Logger:
     _logger.addHandler(console_handler)
 
     _logger.info("=" * 50)
-    _logger.info("PackStation started — v1.5.3")
+    _logger.info("PackStation started — v1.5.4")
     _logger.info(f"Log file: {log_file}")
     _logger.info("=" * 50)
 

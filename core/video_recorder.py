@@ -307,8 +307,9 @@ class VideoRecorder:
             return self._recording.get(key, False)
 
     def cleanup_old_videos(self, retention_days: int = 30, db=None):
-        """Delete video folders older than retention_days (minimum 7 days safety floor) and cleanup DB records."""
+        """Delete video folders older than retention_days (minimum 7 days safety floor) and cleanup DB records only after deletion succeeds."""
         try:
+            import shutil
             database = db or getattr(self, "db", None)
             safe_days = max(7, int(retention_days))
             cutoff = date.today() - __import__("datetime").timedelta(days=safe_days)
@@ -320,14 +321,34 @@ class VideoRecorder:
                     continue
                 try:
                     folder_date = date.fromisoformat(folder_name)
-                    if folder_date < cutoff:
-                        import shutil
-                        shutil.rmtree(folder_path, ignore_errors=True)
+                except ValueError:
+                    continue
+
+                if folder_date < cutoff:
+                    delete_errors = []
+
+                    def _on_rm_error(func, path, exc_info):
+                        err_val = exc_info[1] if isinstance(exc_info, tuple) and len(exc_info) > 1 else exc_info
+                        delete_errors.append((path, err_val))
+                        log.error(f"[Video] ❌ Lỗi không thể xóa file/thư mục video cũ '{path}': {err_val}")
+
+                    try:
+                        shutil.rmtree(folder_path, ignore_errors=False, onerror=_on_rm_error)
+                    except Exception as rm_exc:
+                        delete_errors.append((folder_path, rm_exc))
+                        log.error(f"[Video] ❌ Lỗi không thể xóa thư mục video cũ '{folder_path}': {rm_exc}")
+
+                    if not delete_errors and not os.path.exists(folder_path):
                         log.info(f"[Video] 🗑️ Cleaned old folder: {folder_name} (older than {safe_days} days)")
                         if database:
                             database.remove_videos_in_folder(folder_path)
-                except ValueError:
-                    pass
+                    else:
+                        log.error(
+                            f"[Video] ⚠️ Giữ lại bản ghi SQLite cho các file chưa xóa được trong '{folder_name}' ({len(delete_errors)} lỗi)."
+                        )
+                        if database:
+                            # remove_videos_in_folder checks not os.path.exists(fp) per file
+                            database.remove_videos_in_folder(folder_path)
             if database:
                 database.cleanup_missing_videos()
         except Exception as e:

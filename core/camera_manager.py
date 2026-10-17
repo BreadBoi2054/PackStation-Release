@@ -108,7 +108,9 @@ class CameraStream:
 
                 self._connected = True
                 self._reconnect_attempts = 0
-                log.info(f"[Camera] ✅ Connected: {self.label} ({self.source})")
+                from config import Config
+                safe_src = Config.mask_rtsp_url(str(self.source)) if not isinstance(self.source, int) else self.source
+                log.info(f"[Camera] ✅ Connected: {self.label} ({safe_src})")
                 return True
         except Exception as e:
             log.error(f"[Camera] ❌ Connect error {self.label}: {e}")

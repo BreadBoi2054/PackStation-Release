@@ -35,22 +35,26 @@ from core.audio_manager import AudioManager
 from core.camera_discovery import parse_camera_qr
 
 print()
-print('=== TEST 2: Config + Database ===')
+print('=== TEST 2: Config + Database (Isolated Temp Dir) ===')
 import os
+import tempfile
+import shutil
 base_dir = os.path.dirname(os.path.abspath(__file__))
-cfg = Config(base_dir)
-print(f'  ✅ Config loaded, base_dir={cfg.base_dir}')
+tmp_test_dir = tempfile.mkdtemp(prefix="packstation_test_all_")
+cfg = Config(tmp_test_dir)
+print(f'  ✅ Config loaded, temp_dir={cfg.base_dir}')
 print(f'  ✅ Video dir: {cfg.video_dir}')
 print(f'  ✅ Station 1: {cfg.get_station(1)}')
 
 db = Database(cfg.db_path)
+db.initialize()
 print(f'  ✅ Database opened: {cfg.db_path}')
 count = db.get_today_count()
 print(f'  ✅ Today count: {count}')
 
 print()
 print('=== TEST 3: I18n ===')
-i18n = I18n(language=cfg.language, i18n_dir=cfg.i18n_dir)
+i18n = I18n(language=cfg.language, i18n_dir=os.path.join(base_dir, "i18n"))
 print(f'  ✅ Language: {i18n.language}')
 print(f'  ✅ app.title = {i18n.t("app.title")}')
 print(f'  ✅ nav.camera = {i18n.t("nav.camera")}')
@@ -58,9 +62,11 @@ print(f'  ✅ scan.recording = {i18n.t("scan.recording")}')
 
 print()
 print('=== TEST 4: Order flow ===')
-recorder = VideoRecorder(cfg.video_dir)
-audio = AudioManager(cfg.audio_dir, False)
+recorder = VideoRecorder(os.path.join(tmp_test_dir, "Videos"))
+audio = AudioManager(os.path.join(base_dir, "audio"), False)
 om = OrderManager(db, cfg, recorder, audio)
+om.scan_cooldown_seconds = 0
+om.end_delay_seconds = 0
 
 logs = []
 om.on_log = lambda msg, sid: logs.append(msg)
@@ -99,6 +105,7 @@ print(f'  ✅ NetSDK CLIENT_Cleanup: Done')
 
 db.close()
 recorder.stop_all()
+shutil.rmtree(tmp_test_dir, ignore_errors=True)
 
 print()
 print('🎉 ALL TESTS PASSED!')

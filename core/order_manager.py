@@ -334,9 +334,13 @@ class OrderManager:
                 def _create_db_callback(o_id, channel_num, dur):
                     def _on_video_saved(filepath, size):
                         try:
+                            if not self.db.order_exists(o_id):
+                                log.info(f"[Order] ℹ️ Bỏ qua lưu video cho đơn ID={o_id} ({order_sn}) vì đơn đã bị xóa.")
+                                return
                             health = self.video_recorder.get_recording_health(order_sn, channel_num)
                             check_status, check_message, actual_duration = check_video(filepath, dur, health)
-                            self.db.set_video_check(o_id, channel_num, check_status, check_message, health.get("dropped", 0))
+                            if not self.db.set_video_check(o_id, channel_num, check_status, check_message, health.get("dropped", 0)):
+                                return
                             if check_status != "ok":
                                 self._log(f"⚠️ Video Cam {channel_num} đơn {order_sn}: {check_message}", scanner_id)
                             if filepath and size > 0:
@@ -345,11 +349,12 @@ class OrderManager:
                                 )
                                 if video_id:
                                     self.db.update_video_info(video_id, size, actual_duration)
-                            if self.on_video_checked:
+                            if self.on_video_checked and self.db.order_exists(o_id):
                                 self.on_video_checked(o_id)
                         except Exception as e:
                             log.error(f"[Order] Video check error: {e}")
-                            self.db.set_video_check(o_id, channel_num, "corrupt", str(e))
+                            if self.db.order_exists(o_id):
+                                self.db.set_video_check(o_id, channel_num, "corrupt", str(e))
                     return _on_video_saved
 
                 self.video_recorder.stop_recording(
@@ -374,6 +379,16 @@ class OrderManager:
     def is_finishing(self, scanner_id: int = 1) -> bool:
         with self._lock:
             return scanner_id in self._finishing_orders
+
+    def get_active_or_finishing_order_ids(self) -> set:
+        """Return set of order IDs currently in packing or finishing state across all stations."""
+        with self._lock:
+            ids = {info["id"] for info in self._active_orders.values() if info and "id" in info}
+            ids.update(info["id"] for info in self._finishing_orders.values() if info and "id" in info)
+            return ids
+
+    def is_order_active_or_finishing(self, order_id: int) -> bool:
+        return order_id in self.get_active_or_finishing_order_ids()
 
     def check_timeouts(self):
         """Check if any active order exceeded max recording duration and auto-stop it."""

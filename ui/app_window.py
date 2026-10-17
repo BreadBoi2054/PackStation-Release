@@ -972,9 +972,14 @@ class AppWindow(ctk.CTk):
         )
         row_btn.pack(side="left", padx=(0, PADDING["xs"]), pady=6)
 
+        is_order_live = (
+            status in ("packing", "finishing")
+            or (hasattr(self, "order_mgr") and self.order_mgr and self.order_mgr.is_order_active_or_finishing(order.get("id")))
+        )
         del_btn = ctk.CTkButton(
             btn_box, text="🗑️ Xóa", font=FONTS["small_bold"],
             width=55, height=28, fg_color="#ef4444", hover_color="#dc2626",
+            state="disabled" if is_order_live else "normal",
             command=lambda o=order: self._confirm_delete_order(o)
         )
         del_btn.pack(side="left", pady=6)
@@ -1032,11 +1037,15 @@ class AppWindow(ctk.CTk):
             else:
                 self._open_folder_btn.configure(text="📁 Mở video (Explorer)")
 
+        is_live = (
+            status in ("packing", "finishing")
+            or (order_id and hasattr(self, "order_mgr") and self.order_mgr and self.order_mgr.is_order_active_or_finishing(order_id))
+        )
         if hasattr(self, "_delete_order_btn") and self._delete_order_btn.winfo_exists():
-            self._delete_order_btn.configure(state="normal")
+            self._delete_order_btn.configure(state="disabled" if is_live else "normal")
 
         if hasattr(self, "_zalo_export_btn") and self._zalo_export_btn.winfo_exists():
-            self._zalo_export_btn.configure(state="normal" if video_files and status != "packing" else "disabled")
+            self._zalo_export_btn.configure(state="normal" if video_files and not is_live else "disabled")
 
         if hasattr(self, "_order_video_status") and self._order_video_status.winfo_exists():
             problems = [c for c in video_checks if c["status"] in ("missing", "corrupt", "degraded")]
@@ -1079,7 +1088,20 @@ class AppWindow(ctk.CTk):
         o = dict(order) if not isinstance(order, dict) else order
         order_id = o.get("id")
         order_sn = o.get("order_sn", "")
+        status = (o.get("status") or "").strip().lower()
         if not order_id:
+            return
+
+        active_ids = (
+            self.order_mgr.get_active_or_finishing_order_ids()
+            if hasattr(self, "order_mgr") and self.order_mgr
+            else set()
+        )
+        if status in ("packing", "finishing") or order_id in active_ids:
+            msg = f"⛔ Không thể xóa đơn hàng '{order_sn}' đang trong quá trình ghi hình ({status or 'packing'})!"
+            self._on_log(msg, 1)
+            if hasattr(self, "_order_video_status") and self._order_video_status.winfo_exists():
+                self._order_video_status.configure(text=msg, text_color=COLORS["error"])
             return
 
         dialog = ctk.CTkToplevel(self)
@@ -1119,7 +1141,12 @@ class AppWindow(ctk.CTk):
         def _do_delete():
             dialog.destroy()
             try:
-                self.db.delete_order(order_id, delete_video_files=True)
+                live_ids = (
+                    self.order_mgr.get_active_or_finishing_order_ids()
+                    if hasattr(self, "order_mgr") and self.order_mgr
+                    else set()
+                )
+                self.db.delete_order(order_id, delete_video_files=True, active_order_ids=live_ids)
                 if hasattr(self, "_selected_order") and self._selected_order and self._selected_order.get("id") == order_id:
                     self._selected_order = None
                     if hasattr(self, "_selected_order_title") and self._selected_order_title.winfo_exists():
@@ -2880,8 +2907,9 @@ class AppWindow(ctk.CTk):
         )
 
         def _worker():
-            from core.updater import check_for_update
-            info = check_for_update()
+            from core.updater import check_for_update, get_update_mode
+            mode = get_update_mode(self.config.base_dir)
+            info = check_for_update(target_dir=self.config.base_dir)
 
             def _ui():
                 self._check_update_btn.configure(state="normal", text="🔄 Kiểm tra cập nhật")
@@ -2894,30 +2922,33 @@ class AppWindow(ctk.CTk):
 
                 self._pending_update_info = info
                 latest_ver = info.get("latest_version", "")
-                if info.get("has_update"):
-                    notes = (info.get("release_notes") or "").strip()
-                    short_notes = notes[:220] + ("..." if len(notes) > 220 else "")
-                    msg = f"🎉 Đã có phiên bản mới: {latest_ver}"
-                    if short_notes:
-                        msg += f"\n📋 Nội dung: {short_notes}"
+                if mode == "source_git":
+                    if info.get("has_update"):
+                        msg = f"🎉 Đã có phiên bản mới trên GitHub: {latest_ver} (Chế độ mã nguồn Git)"
+                    else:
+                        msg = f"✅ Đang ở phiên bản {latest_ver} (Chế độ mã nguồn Git). Bấm nút bên dưới để kéo commit mới nhất từ nhánh main."
                     self._update_status_label.configure(
                         text=msg,
                         text_color=COLORS["success"],
                     )
-                    self._apply_update_btn.configure(text=f"⬇️ Tải & Cập nhật ({latest_ver})")
+                    self._apply_update_btn.configure(text="⬇️ Đồng bộ từ Git (git pull)")
                     self._apply_update_btn.pack(side="left")
                 else:
-                    git_dir = os.path.join(self.config.base_dir, ".git")
-                    if not getattr(sys, "frozen", False) and os.path.isdir(git_dir):
+                    if info.get("has_update") and info.get("has_valid_asset"):
+                        notes = (info.get("release_notes") or "").strip()
+                        short_notes = notes[:220] + ("..." if len(notes) > 220 else "")
+                        msg = f"🎉 Đã có phiên bản mới: {latest_ver}"
+                        if short_notes:
+                            msg += f"\n📋 Nội dung: {short_notes}"
                         self._update_status_label.configure(
-                            text=f"✅ Bạn đang ở bản Release mới nhất ({latest_ver}). Bạn cũng có thể kéo code mới nhất trực tiếp từ nhánh main (git pull).",
+                            text=msg,
                             text_color=COLORS["success"],
                         )
-                        self._apply_update_btn.configure(text="⬇️ Đồng bộ từ Git (git pull)")
+                        self._apply_update_btn.configure(text=f"⬇️ Tải & Cập nhật ({latest_ver})")
                         self._apply_update_btn.pack(side="left")
                     else:
                         self._update_status_label.configure(
-                            text=f"✅ Bạn đang sử dụng phiên bản mới nhất ({latest_ver}).",
+                            text=f"✅ Bạn đang sử dụng phiên bản portable mới nhất ({latest_ver}).",
                             text_color=COLORS["success"],
                         )
 
@@ -2926,7 +2957,7 @@ class AppWindow(ctk.CTk):
         threading.Thread(target=_worker, daemon=True, name="CheckUpdateWorker").start()
 
     def _on_apply_update(self):
-        """Download and apply the update safely (either via GitHub Release ZIP or git pull)."""
+        """Download and apply the update safely (strictly separated between Portable Release ZIP and Source Git mode)."""
         if self._is_any_order_packing():
             self._update_status_label.configure(
                 text="⛔ Không thể cập nhật khi đang quay video đóng gói! Vui lòng kết thúc đơn hàng trước.",
@@ -2935,8 +2966,6 @@ class AppWindow(ctk.CTk):
             return
 
         info = self._pending_update_info or {}
-        is_frozen = getattr(sys, "frozen", False)
-        git_dir = os.path.join(self.config.base_dir, ".git")
 
         self._check_update_btn.configure(state="disabled")
         self._apply_update_btn.configure(state="disabled", text="⏳ Đang cập nhật...")
@@ -2947,11 +2976,14 @@ class AppWindow(ctk.CTk):
             from core.updater import (
                 create_and_run_updater_script,
                 download_and_stage_update,
+                get_update_mode,
                 update_via_git_pull,
             )
 
-            # Case 1: Running from source with .git and either no new release binary or user clicked git pull
-            if not is_frozen and os.path.isdir(git_dir) and not info.get("has_update"):
+            mode = get_update_mode(self.config.base_dir)
+
+            # Mode 1: Source code repository (.git without PackStation.exe) -> strictly use git pull
+            if mode == "source_git":
                 res = update_via_git_pull(self.config.base_dir)
 
                 def _ui_git():
@@ -2967,21 +2999,21 @@ class AppWindow(ctk.CTk):
                         self._on_log("✅ Cập nhật mã nguồn từ Git thành công!", 0)
                     else:
                         self._update_status_label.configure(
-                            text=f"❌ Lỗi git pull: {res['error']}",
+                            text=f"❌ Lỗi cập nhật Git: {res['error']}",
                             text_color=COLORS["danger"],
                         )
 
                 self._safe_dispatch(_ui_git)
                 return
 
-            # Case 2: Download Release ZIP package and stage update
+            # Mode 2: Portable installation -> strictly require verified portable Release ZIP asset
             download_url = info.get("download_url", "")
-            if not download_url:
+            if not download_url or not info.get("has_valid_asset"):
                 def _ui_no_url():
                     self._check_update_btn.configure(state="normal")
                     self._apply_update_btn.configure(state="normal")
                     self._update_status_label.configure(
-                        text="❌ Không tìm thấy gói tải về (.zip) trong bản Release này.",
+                        text="❌ Bản Release không có gói cài đặt portable (.zip) hợp lệ. Đã giữ nguyên phiên bản hiện tại.",
                         text_color=COLORS["danger"],
                     )
                 self._safe_dispatch(_ui_no_url)
@@ -2997,6 +3029,8 @@ class AppWindow(ctk.CTk):
                 download_url=download_url,
                 target_dir=self.config.base_dir,
                 progress_callback=_progress,
+                expected_size=int(info.get("asset_size") or 0),
+                expected_sha256=str(info.get("asset_sha256") or ""),
             )
 
             if not stage_res.get("ok"):
@@ -3012,7 +3046,7 @@ class AppWindow(ctk.CTk):
 
             def _ui_finish_and_restart():
                 self._update_status_label.configure(
-                    text="✅ Tải hoàn tất! Đang áp dụng bản cập nhật và tự khởi động lại...",
+                    text="✅ Tải & kiểm tra hoàn tất! Đang áp dụng bản cập nhật và tự khởi động lại...",
                     text_color=COLORS["success"],
                 )
                 self._on_log("🚀 Đang khởi động lại để hoàn tất cập nhật...", 0)
@@ -3022,6 +3056,7 @@ class AppWindow(ctk.CTk):
                     staged_source_dir=staged_dir,
                     target_dir=self.config.base_dir,
                     exe_name="PackStation.exe",
+                    wait_pid=os.getpid(),
                     launch_after=True,
                 )
                 self.destroy()

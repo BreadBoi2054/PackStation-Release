@@ -57,11 +57,14 @@ class Config:
         os.makedirs(self.video_dir, exist_ok=True)
 
     def _load(self):
+        self._had_plaintext_credentials = False
+        self._dpapi_migration_warning = False
         if os.path.exists(self.config_path):
             try:
                 with open(self.config_path, "r", encoding="utf-8") as f:
                     saved = json.load(f)
                 self._deep_merge(self.data, saved)
+                self._decrypt_stations_in_memory()
             except Exception as e:
                 from core.logger import get_logger
                 get_logger().error(f"[Config] Load error: {e}")
@@ -73,10 +76,65 @@ class Config:
             else:
                 base[key] = value
 
+    def _decrypt_stations_in_memory(self):
+        """Decrypt any encrypted RTSP credentials loaded from disk into runtime memory."""
+        stations = self.data.get("stations", {})
+        if not isinstance(stations, dict):
+            return
+        for st in stations.values():
+            if not isinstance(st, dict):
+                continue
+            for key in ("camera_source", "camera_source_2", "camera_source_3"):
+                val = st.get(key, "")
+                if isinstance(val, str) and val:
+                    if self._has_plaintext_rtsp_password(val):
+                        self._had_plaintext_credentials = True
+                    st[key] = self.decrypt_rtsp_url(val)
+            if "cameras" in st and isinstance(st["cameras"], list):
+                new_cams = []
+                for c in st["cameras"]:
+                    if isinstance(c, str) and c:
+                        if self._has_plaintext_rtsp_password(c):
+                            self._had_plaintext_credentials = True
+                        new_cams.append(self.decrypt_rtsp_url(c))
+                    else:
+                        new_cams.append(c)
+                st["cameras"] = new_cams
+
+    @classmethod
+    def _encrypt_stations_for_disk(cls, data_dict: dict) -> dict:
+        """Return a deep copy of config data with all RTSP passwords encrypted via DPAPI for disk storage."""
+        import copy
+        out = copy.deepcopy(data_dict)
+        stations = out.get("stations", {})
+        if isinstance(stations, dict):
+            for st in stations.values():
+                if not isinstance(st, dict):
+                    continue
+                for key in ("camera_source", "camera_source_2", "camera_source_3"):
+                    val = st.get(key, "")
+                    if isinstance(val, str) and val:
+                        st[key] = cls.encrypt_rtsp_url(val)
+                if "cameras" in st and isinstance(st["cameras"], list):
+                    st["cameras"] = [
+                        cls.encrypt_rtsp_url(c) if isinstance(c, str) and c else c
+                        for c in st["cameras"]
+                    ]
+        return out
+
+    def migrate_plaintext_credentials(self) -> bool:
+        """Convert any legacy plaintext RTSP passwords on disk to DPAPI-encrypted format."""
+        if self._had_plaintext_credentials:
+            self.save()
+            self._had_plaintext_credentials = False
+            return True
+        return False
+
     def save(self):
         try:
+            disk_data = self._encrypt_stations_for_disk(self.data)
             with open(self.config_path, "w", encoding="utf-8") as f:
-                json.dump(self.data, f, indent=2, ensure_ascii=False)
+                json.dump(disk_data, f, indent=2, ensure_ascii=False)
         except Exception as e:
             from core.logger import get_logger
             get_logger().error(f"[Config] Save error: {e}")
@@ -104,25 +162,26 @@ class Config:
         return stations[key]
 
     def get_station_cameras(self, station_id: int = 1) -> list:
-        """Get list of camera URLs for station, supporting dynamic count."""
+        """Get list of decrypted camera URLs for station, supporting dynamic count."""
         st = self.get_station(station_id)
         if "cameras" in st and isinstance(st["cameras"], list) and st["cameras"]:
-            return [str(c) for c in st["cameras"]]
+            return [self.decrypt_rtsp_url(str(c)) for c in st["cameras"]]
         # Fallback to legacy fields
         cams = []
         for k in ["camera_source", "camera_source_2", "camera_source_3"]:
             val = st.get(k, "").strip()
             if val:
-                cams.append(val)
+                cams.append(self.decrypt_rtsp_url(val))
         return cams if cams else [""]
 
     def set_station_cameras(self, cameras: list, station_id: int = 1):
-        """Set list of camera URLs for station and keep legacy fields in sync."""
+        """Set list of camera URLs for station (decrypted in memory, encrypted on disk)."""
         st = self.get_station(station_id)
-        st["cameras"] = [c.strip() for c in cameras]
-        st["camera_source"] = cameras[0].strip() if len(cameras) > 0 else ""
-        st["camera_source_2"] = cameras[1].strip() if len(cameras) > 1 else ""
-        st["camera_source_3"] = cameras[2].strip() if len(cameras) > 2 else ""
+        decrypted_cams = [self.decrypt_rtsp_url(c.strip()) for c in cameras]
+        st["cameras"] = decrypted_cams
+        st["camera_source"] = decrypted_cams[0] if len(decrypted_cams) > 0 else ""
+        st["camera_source_2"] = decrypted_cams[1] if len(decrypted_cams) > 1 else ""
+        st["camera_source_3"] = decrypted_cams[2] if len(decrypted_cams) > 2 else ""
         self.data["stations"][str(station_id)] = st
         self.save()
 
@@ -151,6 +210,160 @@ class Config:
             import hashlib
             hashed = hashlib.sha256(pin_str.encode("utf-8")).hexdigest()
             self.set("pin_code", hashed)
+
+    # ── Windows DPAPI Credential Protection for RTSP URLs ──
+    _DPAPI_ENTROPY = b"PackStation-Camera-Cred-v1"
+
+    @classmethod
+    def encrypt_secret(cls, plain_text: str) -> str:
+        """Encrypt a credential string using Windows DPAPI (LocalMachine scope for station portability across Windows users on the same PC)."""
+        if not plain_text:
+            return ""
+        if plain_text.startswith("ENC[") and plain_text.endswith("]"):
+            return plain_text
+        raw_bytes = plain_text.encode("utf-8")
+        if os.name == "nt":
+            try:
+                import ctypes
+                from ctypes import wintypes
+
+                class DATA_BLOB(ctypes.Structure):
+                    _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+                crypt32 = ctypes.windll.crypt32
+                kernel32 = ctypes.windll.kernel32
+
+                in_buf = ctypes.create_string_buffer(raw_bytes, len(raw_bytes))
+                in_blob = DATA_BLOB(len(raw_bytes), ctypes.cast(in_buf, ctypes.POINTER(ctypes.c_char)))
+
+                ent_buf = ctypes.create_string_buffer(cls._DPAPI_ENTROPY, len(cls._DPAPI_ENTROPY))
+                ent_blob = DATA_BLOB(len(cls._DPAPI_ENTROPY), ctypes.cast(ent_buf, ctypes.POINTER(ctypes.c_char)))
+
+                out_blob = DATA_BLOB()
+                # CRYPTPROTECT_UI_FORBIDDEN (0x1) | CRYPTPROTECT_LOCAL_MACHINE (0x4)
+                flags = 0x01 | 0x04
+                if crypt32.CryptProtectData(
+                    ctypes.byref(in_blob), None, ctypes.byref(ent_blob), None, None, flags, ctypes.byref(out_blob)
+                ):
+                    try:
+                        enc_bytes = ctypes.string_at(out_blob.pbData, out_blob.cbData)
+                        b64 = base64.urlsafe_b64encode(enc_bytes).decode("ascii")
+                        return f"ENC[dpapi:{b64}]"
+                    finally:
+                        kernel32.LocalFree(out_blob.pbData)
+            except Exception:
+                pass
+        # Fallback if DPAPI unavailable
+        b64 = base64.urlsafe_b64encode(raw_bytes).decode("ascii")
+        return f"ENC[b64:{b64}]"
+
+    @classmethod
+    def decrypt_secret(cls, token: str) -> str:
+        """Decrypt an ENC[dpapi:...] or ENC[b64:...] credential token. Returns '' if machine key mismatches."""
+        if not token:
+            return ""
+        if not (token.startswith("ENC[") and token.endswith("]")):
+            return token
+        inner = token[4:-1]
+        if inner.startswith("dpapi:"):
+            b64_part = inner[len("dpapi:"):]
+            if os.name == "nt":
+                try:
+                    import ctypes
+                    from ctypes import wintypes
+
+                    class DATA_BLOB(ctypes.Structure):
+                        _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+                    crypt32 = ctypes.windll.crypt32
+                    kernel32 = ctypes.windll.kernel32
+
+                    enc_bytes = base64.urlsafe_b64decode(b64_part.encode("ascii"))
+                    in_buf = ctypes.create_string_buffer(enc_bytes, len(enc_bytes))
+                    in_blob = DATA_BLOB(len(enc_bytes), ctypes.cast(in_buf, ctypes.POINTER(ctypes.c_char)))
+
+                    ent_buf = ctypes.create_string_buffer(cls._DPAPI_ENTROPY, len(cls._DPAPI_ENTROPY))
+                    ent_blob = DATA_BLOB(len(cls._DPAPI_ENTROPY), ctypes.cast(ent_buf, ctypes.POINTER(ctypes.c_char)))
+
+                    out_blob = DATA_BLOB()
+                    if crypt32.CryptUnprotectData(
+                        ctypes.byref(in_blob), None, ctypes.byref(ent_blob), None, None, 0x01, ctypes.byref(out_blob)
+                    ):
+                        try:
+                            dec_bytes = ctypes.string_at(out_blob.pbData, out_blob.cbData)
+                            return dec_bytes.decode("utf-8")
+                        finally:
+                            kernel32.LocalFree(out_blob.pbData)
+                except Exception:
+                    pass
+            from core.logger import get_logger
+            get_logger().warning(
+                "[Config] ⚠️ Không thể giải mã mật khẩu camera (cấu hình được tạo trên máy Windows khác). Vui lòng nhập lại mật khẩu camera trong Cài đặt."
+            )
+            return ""
+        elif inner.startswith("b64:"):
+            try:
+                return base64.urlsafe_b64decode(inner[4:].encode("ascii")).decode("utf-8")
+            except Exception:
+                return ""
+        return ""
+
+    @staticmethod
+    def _has_plaintext_rtsp_password(url: str) -> bool:
+        if not url or not url.strip().lower().startswith("rtsp://"):
+            return False
+        body = url.strip()[7:]
+        if "@" not in body:
+            return False
+        creds = body[:body.rfind("@")]
+        if ":" not in creds:
+            return False
+        _, pwd = creds.split(":", 1)
+        return bool(pwd and not (pwd.startswith("ENC[") and pwd.endswith("]")))
+
+    @classmethod
+    def encrypt_rtsp_url(cls, url: str) -> str:
+        """Encrypt the password segment of an RTSP URL for safe storage in packstation-config.json."""
+        if not url or not url.strip().lower().startswith("rtsp://"):
+            return url
+        u = url.strip()
+        prefix = u[:7]
+        body = u[7:]
+        if "@" not in body:
+            return u
+        last_at = body.rfind("@")
+        creds = body[:last_at]
+        host_path = body[last_at + 1:]
+        if ":" not in creds:
+            return u
+        user, pwd = creds.split(":", 1)
+        if not pwd or (pwd.startswith("ENC[") and pwd.endswith("]")):
+            return u
+        enc_pwd = cls.encrypt_secret(pwd)
+        return f"{prefix}{user}:{enc_pwd}@{host_path}"
+
+    @classmethod
+    def decrypt_rtsp_url(cls, url: str) -> str:
+        """Decrypt the password segment of an RTSP URL for runtime use."""
+        if not url or not url.strip().lower().startswith("rtsp://"):
+            return url
+        u = url.strip()
+        prefix = u[:7]
+        body = u[7:]
+        if "@" not in body:
+            return u
+        last_at = body.rfind("@")
+        creds = body[:last_at]
+        host_path = body[last_at + 1:]
+        if ":" not in creds:
+            return u
+        user, pwd = creds.split(":", 1)
+        if not (pwd.startswith("ENC[") and pwd.endswith("]")):
+            return u
+        dec_pwd = cls.decrypt_secret(pwd)
+        if dec_pwd:
+            return f"{prefix}{user}:{dec_pwd}@{host_path}"
+        return f"{prefix}{user}@{host_path}"
 
     @staticmethod
     def mask_rtsp_url(url: str) -> str:

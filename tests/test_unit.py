@@ -261,6 +261,7 @@ class TestDatabase(unittest.TestCase):
             f.write("dummy")
         self.db.add_video(order_id, "del_test.mp4", vid_file, 1)
         self.db.add_scan_log("DEL_TEST_01", 1, "barcode", order_id)
+        self.db.end_order(order_id, status="completed")
 
         self.assertIsNotNone(self.db.conn.execute("SELECT id FROM orders WHERE id=?", (order_id,)).fetchone())
         self.assertTrue(os.path.exists(vid_file))
@@ -903,7 +904,7 @@ class TestBarcodeFilter(unittest.TestCase):
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
     def test_updater_version_comparison_and_data_safety(self):
-        """Test Auto-Updater version comparison, backup, and protection of DB/config/Videos."""
+        """Test Auto-Updater version comparison, SQLite online WAL backup, and protection of DB/config/Videos."""
         import tempfile
         from core.updater import (
             backup_user_data,
@@ -922,23 +923,28 @@ class TestBarcodeFilter(unittest.TestCase):
 
         tmp_dir = tempfile.mkdtemp()
         try:
-            # 1. Test backup_user_data
+            # 1. Test backup_user_data with a real SQLite WAL database
             db_file = os.path.join(tmp_dir, "packstation.db")
+            db = Database(db_file)
+            db.initialize()
+            db.start_order("UPD_ORDER_01", 1)
+            db.close()
+
             cfg_file = os.path.join(tmp_dir, "packstation-config.json")
-            with open(db_file, "wb") as f:
-                f.write(b"important_sqlite_data")
             with open(cfg_file, "w", encoding="utf-8") as f:
                 f.write('{"station_name": "Ban 1"}')
 
-            backups = backup_user_data(tmp_dir)
-            self.assertEqual(len(backups), 2)
-            for b in backups:
+            backup_res = backup_user_data(tmp_dir)
+            self.assertTrue(backup_res["ok"])
+            self.assertEqual(len(backup_res["backups"]), 2)
+            for b in backup_res["backups"]:
                 self.assertTrue(os.path.exists(b))
 
             # 2. Test strip_protected_items removes DB, config, Videos, logs from staged folder
             staged = os.path.join(tmp_dir, "staged")
             os.makedirs(os.path.join(staged, "Videos"), exist_ok=True)
             os.makedirs(os.path.join(staged, "logs"), exist_ok=True)
+            os.makedirs(os.path.join(staged, "_internal"), exist_ok=True)
             with open(os.path.join(staged, "packstation.db"), "wb") as f:
                 f.write(b"empty_release_db")
             with open(os.path.join(staged, "packstation-config.json"), "w") as f:
@@ -954,13 +960,365 @@ class TestBarcodeFilter(unittest.TestCase):
             self.assertTrue(os.path.exists(os.path.join(staged, "PackStation.exe")))
 
             # 3. Test updater script generation without launching
-            bat_path = create_and_run_updater_script(staged, tmp_dir, launch_after=False)
+            bat_path = create_and_run_updater_script(staged, tmp_dir, launch_after=False, restart_app=False)
             self.assertTrue(os.path.exists(bat_path))
             with open(bat_path, "r", encoding="utf-8") as f:
                 bat_text = f.read()
             self.assertIn("robocopy", bat_text)
             self.assertIn("packstation.db", bat_text)
             self.assertIn("packstation-config.json", bat_text)
+            self.assertIn("GEQ 8", bat_text)
+            self.assertIn(":rollback", bat_text)
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_sqlite_wal_uncheckpointed_backup_and_failure_abort(self):
+        """Test Requirement 1: SQLite Backup API captures uncheckpointed WAL transactions and aborts on corrupt DB."""
+        import sqlite3
+        import tempfile
+        from core.updater import backup_sqlite_database, backup_user_data
+
+        tmp_dir = tempfile.mkdtemp()
+        try:
+            db_path = os.path.join(tmp_dir, "packstation.db")
+            db = Database(db_path)
+            db.initialize()
+            # Disable auto-checkpoint so writes remain in the -wal file
+            db.conn.execute("PRAGMA wal_autocheckpoint=0")
+            db.start_order("WAL_UNCHECKPOINTED_001", 1)
+            db.start_order("WAL_UNCHECKPOINTED_002", 1)
+
+            wal_file = db_path + "-wal"
+            self.assertTrue(os.path.exists(wal_file))
+            self.assertGreater(os.path.getsize(wal_file), 0)
+
+            # While db connection is still open and WAL is NOT checkpointed, run backup_sqlite_database
+            backup_path = os.path.join(tmp_dir, "packstation_wal_backup.db")
+            res = backup_sqlite_database(db_path, backup_path)
+            self.assertTrue(res["ok"], f"Backup failed: {res.get('error')}")
+            self.assertTrue(os.path.exists(backup_path))
+
+            # Open backup in isolated connection and verify uncheckpointed WAL rows are present
+            bak_conn = sqlite3.connect(backup_path)
+            rows = bak_conn.execute("SELECT order_sn FROM orders ORDER BY id").fetchall()
+            bak_conn.close()
+            order_sns = [r[0] for r in rows]
+            self.assertIn("WAL_UNCHECKPOINTED_001", order_sns)
+            self.assertIn("WAL_UNCHECKPOINTED_002", order_sns)
+            db.close()
+
+            # Test corrupt database causes backup_user_data to fail and abort update
+            corrupt_dir = os.path.join(tmp_dir, "corrupt_env")
+            os.makedirs(corrupt_dir, exist_ok=True)
+            with open(os.path.join(corrupt_dir, "packstation.db"), "wb") as f:
+                f.write(b"NOT_A_VALID_SQLITE_HEADER_CORRUPT_DATA_1234567890")
+            bad_res = backup_user_data(corrupt_dir)
+            self.assertFalse(bad_res["ok"])
+            self.assertIn("thất bại", bad_res["error"])
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_update_package_rejects_source_only_zip_and_zipball(self):
+        """Test Requirement 2: Reject source-only ZIP (missing PackStation.exe), zipball URLs, and checksum mismatches."""
+        import hashlib
+        import pathlib
+        import tempfile
+        import zipfile
+        from core.updater import (
+            download_and_stage_update,
+            get_update_mode,
+            is_trusted_download_url,
+            validate_portable_package,
+        )
+
+        # 1. Source zipball URLs and untrusted domains must be rejected
+        self.assertFalse(
+            is_trusted_download_url("https://api.github.com/repos/BreadBoi2054/PackStation-Release/zipball/v1.5.5")
+        )
+        self.assertFalse(is_trusted_download_url("https://evil.example.com/PackStation.zip"))
+        self.assertTrue(
+            is_trusted_download_url(
+                "https://github.com/BreadBoi2054/PackStation-Release/releases/download/v1.5.5/PackStation-v1.5.5-Windows.zip"
+            )
+        )
+
+        tmp_dir = tempfile.mkdtemp()
+        try:
+            # 2. Separate source_git mode vs portable mode
+            src_mode_dir = os.path.join(tmp_dir, "src_repo")
+            os.makedirs(os.path.join(src_mode_dir, ".git"), exist_ok=True)
+            self.assertEqual(get_update_mode(src_mode_dir), "source_git")
+
+            portable_mode_dir = os.path.join(tmp_dir, "portable_app")
+            os.makedirs(portable_mode_dir, exist_ok=True)
+            with open(os.path.join(portable_mode_dir, "PackStation.exe"), "wb") as f:
+                f.write(b"MZ_FAKE_EXE")
+            self.assertEqual(get_update_mode(portable_mode_dir), "portable")
+
+            # 3. Create a source-only ZIP (no PackStation.exe) -> must be rejected!
+            src_zip_path = os.path.join(tmp_dir, "source_only.zip")
+            with zipfile.ZipFile(src_zip_path, "w") as zf:
+                zf.writestr("PackStation-main/main.py", "print('hello')")
+                zf.writestr("PackStation-main/config.py", "DEFAULTS = {}")
+
+            src_zip_url = pathlib.Path(src_zip_path).as_uri()
+            stage_res = download_and_stage_update(src_zip_url, portable_mode_dir)
+            self.assertFalse(stage_res["ok"])
+            self.assertIn("PackStation.exe", stage_res["error"])
+
+            # 4. Create a valid portable ZIP and verify checksum validation
+            valid_zip_path = os.path.join(tmp_dir, "PackStation-v1.5.6-Windows.zip")
+            with zipfile.ZipFile(valid_zip_path, "w") as zf:
+                zf.writestr("PackStation/PackStation.exe", "MZ_NEW_EXE_V156")
+                zf.writestr("PackStation/_internal/python314.dll", "DLL_BYTES")
+                zf.writestr("PackStation/i18n/vi-VN.json", "{}")
+
+            with open(valid_zip_path, "rb") as f:
+                zip_bytes = f.read()
+            true_sha = hashlib.sha256(zip_bytes).hexdigest()
+            valid_url = pathlib.Path(valid_zip_path).as_uri()
+
+            # Wrong SHA-256 must be rejected
+            bad_sha_res = download_and_stage_update(
+                valid_url, portable_mode_dir, expected_sha256="0" * 64
+            )
+            self.assertFalse(bad_sha_res["ok"])
+            self.assertIn("SHA-256", bad_sha_res["error"])
+
+            # Correct SHA-256 and size must succeed
+            good_res = download_and_stage_update(
+                valid_url,
+                portable_mode_dir,
+                expected_size=len(zip_bytes),
+                expected_sha256=true_sha,
+            )
+            self.assertTrue(good_res["ok"], f"Expected success, got: {good_res.get('error')}")
+            ok_pkg, _ = validate_portable_package(good_res["staged_dir"])
+            self.assertTrue(ok_pkg)
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_portable_updater_batch_execution_and_rollback_in_isolated_temp(self):
+        """Test Requirement 3: Run updater_apply.bat in isolated temp dir; verify update preserves DB/WAL/config/Videos and rolls back on failure."""
+        import subprocess
+        import tempfile
+        from core.updater import create_and_run_updater_script
+
+        tmp_dir = tempfile.mkdtemp()
+        try:
+            target_dir = os.path.join(tmp_dir, "app")
+            staged_dir = os.path.join(tmp_dir, "app", "temp_update", "extracted", "PackStation")
+            os.makedirs(os.path.join(target_dir, "_internal"), exist_ok=True)
+            os.makedirs(os.path.join(target_dir, "Videos", "2026-10-17"), exist_ok=True)
+            os.makedirs(os.path.join(target_dir, "logs"), exist_ok=True)
+            os.makedirs(os.path.join(staged_dir, "_internal"), exist_ok=True)
+
+            # Existing portable files + user data
+            with open(os.path.join(target_dir, "PackStation.exe"), "wb") as f:
+                f.write(b"OLD_EXE_V155")
+            with open(os.path.join(target_dir, "_internal", "core.pyd"), "wb") as f:
+                f.write(b"OLD_CORE")
+            with open(os.path.join(target_dir, "packstation.db"), "wb") as f:
+                f.write(b"USER_SQLITE_DB_CONTENT")
+            with open(os.path.join(target_dir, "packstation.db-wal"), "wb") as f:
+                f.write(b"USER_WAL_DATA")
+            with open(os.path.join(target_dir, "packstation-config.json"), "w", encoding="utf-8") as f:
+                f.write('{"custom": "keep_me"}')
+            vid_file = os.path.join(target_dir, "Videos", "2026-10-17", "ORDER1_Cam1.mp4")
+            with open(vid_file, "wb") as f:
+                f.write(b"REAL_VIDEO_EVIDENCE")
+
+            # New staged portable files
+            with open(os.path.join(staged_dir, "PackStation.exe"), "wb") as f:
+                f.write(b"NEW_EXE_V156")
+            with open(os.path.join(staged_dir, "_internal", "core.pyd"), "wb") as f:
+                f.write(b"NEW_CORE")
+
+            bat_path = create_and_run_updater_script(
+                staged_dir, target_dir, launch_after=False, restart_app=False
+            )
+            proc = subprocess.run(["cmd.exe", "/c", bat_path], cwd=target_dir, timeout=20)
+            self.assertEqual(proc.returncode, 0)
+
+            # Verify binary updated while DB, WAL, config, Videos are untouched
+            with open(os.path.join(target_dir, "PackStation.exe"), "rb") as f:
+                self.assertEqual(f.read(), b"NEW_EXE_V156")
+            with open(os.path.join(target_dir, "packstation.db"), "rb") as f:
+                self.assertEqual(f.read(), b"USER_SQLITE_DB_CONTENT")
+            with open(os.path.join(target_dir, "packstation.db-wal"), "rb") as f:
+                self.assertEqual(f.read(), b"USER_WAL_DATA")
+            with open(os.path.join(target_dir, "packstation-config.json"), "r", encoding="utf-8") as f:
+                self.assertIn("keep_me", f.read())
+            self.assertTrue(os.path.exists(vid_file))
+
+            # Part B: Simulate mid-update copy failure (staged_dir missing at execution time) -> rollback must restore OLD binary and keep temp_update
+            os.makedirs(os.path.join(staged_dir, "_internal"), exist_ok=True)
+            with open(os.path.join(staged_dir, "PackStation.exe"), "wb") as f:
+                f.write(b"BROKEN_STAGE_EXE")
+            bat_path_fail = create_and_run_updater_script(
+                staged_dir, target_dir, launch_after=False, restart_app=False
+            )
+            # Remove staged_dir before running batch script so robocopy fails with code >= 8 (code 16: source missing)
+            shutil.rmtree(staged_dir)
+            # Corrupt target PackStation.exe slightly after snapshot would not happen, or verify snapshot restores if copy fails
+            proc_fail = subprocess.run(["cmd.exe", "/c", bat_path_fail], cwd=target_dir, timeout=20)
+            self.assertEqual(proc_fail.returncode, 3)
+            # Verify temp_update and rollback_snapshot were preserved and PackStation.exe is still intact (NEW_EXE_V156)
+            self.assertTrue(os.path.exists(os.path.join(target_dir, "temp_update", "rollback_snapshot", "PackStation.exe")))
+            with open(os.path.join(target_dir, "PackStation.exe"), "rb") as f:
+                self.assertEqual(f.read(), b"NEW_EXE_V156")
+            self.assertTrue(os.path.exists(os.path.join(target_dir, "logs", "updater_error.log")))
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_cleanup_old_videos_preserves_sqlite_on_delete_failure_and_strict_prefix(self):
+        """Test Requirement 4: Failed file deletion keeps both file and SQLite record with error logged; similar folder prefixes do not collide."""
+        import tempfile
+        from datetime import date, timedelta
+        from unittest.mock import patch
+
+        tmp_dir = tempfile.mkdtemp()
+        try:
+            db = Database(os.path.join(tmp_dir, "test.db"))
+            db.initialize()
+            rec = VideoRecorder(tmp_dir, db=db)
+
+            # 1. Test prefix boundary: folder '2026-08-01' vs '2026-08-01_keep'
+            dir_a = os.path.join(tmp_dir, "2026-08-01")
+            dir_b = os.path.join(tmp_dir, "2026-08-01_keep")
+            os.makedirs(dir_a, exist_ok=True)
+            os.makedirs(dir_b, exist_ok=True)
+            vid_a = os.path.join(dir_a, "ORD_A_Cam1.mp4")
+            vid_b = os.path.join(dir_b, "ORD_B_Cam1.mp4")
+            with open(vid_a, "wb") as f:
+                f.write(b"a")
+            with open(vid_b, "wb") as f:
+                f.write(b"b")
+
+            oid_a = db.start_order("ORD_A", 1)
+            oid_b = db.start_order("ORD_B", 1)
+            db.add_video(oid_a, "ORD_A_Cam1.mp4", vid_a, 1)
+            db.add_video(oid_b, "ORD_B_Cam1.mp4", vid_b, 1)
+
+            # Simulate failed deletion of dir_a (file still exists on disk)
+            def _failing_rmtree(path, ignore_errors=False, onerror=None):
+                if onerror:
+                    try:
+                        raise PermissionError("Simulated file lock: video is open in player")
+                    except PermissionError:
+                        import sys as _sys
+                        onerror(os.remove, vid_a, _sys.exc_info())
+
+            old_date = (date.today() - timedelta(days=45)).isoformat()
+            locked_dir = os.path.join(tmp_dir, old_date)
+            os.makedirs(locked_dir, exist_ok=True)
+            locked_vid = os.path.join(locked_dir, "LOCKED_ORD_Cam1.mp4")
+            with open(locked_vid, "wb") as f:
+                f.write(b"locked_video_data")
+            oid_locked = db.start_order("LOCKED_ORD", 1)
+            db.add_video(oid_locked, "LOCKED_ORD_Cam1.mp4", locked_vid, 1)
+
+            with patch("shutil.rmtree", side_effect=_failing_rmtree):
+                with self.assertLogs("PackStation", level="ERROR") as cm:
+                    rec.cleanup_old_videos(retention_days=30, db=db)
+                self.assertTrue(any("Lỗi không thể xóa" in m for m in cm.output))
+
+            # Both the locked physical file AND its SQLite record must still exist!
+            self.assertTrue(os.path.exists(locked_vid))
+            self.assertEqual(len(db.get_order_videos(oid_locked)), 1)
+
+            # Now test remove_videos_in_folder directly when dir_a is deleted vs dir_b kept
+            os.remove(vid_a)
+            os.rmdir(dir_a)
+            db.remove_videos_in_folder(dir_a)
+            self.assertEqual(len(db.get_order_videos(oid_a)), 0)
+            # dir_b ('2026-08-01_keep') must NOT be matched by '2026-08-01' prefix!
+            self.assertEqual(len(db.get_order_videos(oid_b)), 1)
+
+            rec.stop_all()
+            db.close()
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_cannot_delete_active_or_finishing_order_and_callback_ignores_deleted_order(self):
+        """Test Requirement 5: Block deleting packing/finishing orders and prevent late recording callback from inserting into deleted order."""
+        import tempfile
+        tmp_dir = tempfile.mkdtemp()
+        try:
+            cfg = Config(tmp_dir)
+            cfg.set("end_delay_seconds", 5.0)
+            cfg.set("scan_cooldown_seconds", 0.0)
+            db = Database(os.path.join(tmp_dir, "test.db"))
+            db.initialize()
+            mgr = OrderManager(db, cfg, video_recorder=None, audio_manager=None)
+
+            # 1. Start order -> status is 'packing' -> delete_order must raise ValueError
+            mgr.process_scan("ACTIVE_DEL_TEST", scanner_id=1)
+            active = mgr.get_active_order(1)
+            self.assertIsNotNone(active)
+            order_id = active["id"]
+
+            with self.assertRaises(ValueError):
+                db.delete_order(order_id, active_order_ids=mgr.get_active_or_finishing_order_ids())
+
+            # 2. Transition order to 'finishing' (delayed stop) -> delete_order must still raise ValueError
+            mgr.process_scan("KETTHUC", scanner_id=1)
+            self.assertTrue(mgr.is_finishing(1))
+            with self.assertRaises(ValueError):
+                db.delete_order(order_id, active_order_ids=mgr.get_active_or_finishing_order_ids())
+
+            # 3. Cancel order -> status becomes 'cancelled' -> now deletion is allowed
+            mgr.process_scan("HUYDON", scanner_id=1)
+            db.delete_order(order_id, active_order_ids=mgr.get_active_or_finishing_order_ids())
+            self.assertFalse(db.order_exists(order_id))
+
+            # 4. Late video callback firing after order was deleted must NOT re-insert video or check rows
+            vid_id = db.add_video(order_id, "GHOST.mp4", os.path.join(tmp_dir, "GHOST.mp4"), 1)
+            chk_ok = db.set_video_check(order_id, 1, "ok", "Late callback")
+            self.assertIsNone(vid_id)
+            self.assertFalse(chk_ok)
+            self.assertEqual(len(db.get_order_videos(order_id)), 0)
+            self.assertEqual(len(db.get_video_checks(order_id)), 0)
+
+            db.close()
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_camera_password_dpapi_encryption_at_rest_and_legacy_migration(self):
+        """Test Requirement 6: RTSP passwords are encrypted at rest in packstation-config.json via Windows DPAPI and legacy plaintext configs migrate cleanly."""
+        import json
+        import tempfile
+        tmp_dir = tempfile.mkdtemp()
+        try:
+            # 1. Simulate legacy plaintext config on disk
+            cfg_path = os.path.join(tmp_dir, "packstation-config.json")
+            raw_rtsp = "rtsp://admin:CamSecretPass2026@192.168.1.108:554/cam/realmonitor?channel=1&subtype=0"
+            legacy_data = {
+                "stations": {
+                    "1": {
+                        "name": "Bàn 1",
+                        "camera_source": raw_rtsp,
+                        "cameras": [raw_rtsp],
+                    }
+                }
+            }
+            with open(cfg_path, "w", encoding="utf-8") as f:
+                json.dump(legacy_data, f)
+
+            # Load legacy config -> in-memory camera URL must be usable plaintext
+            cfg = Config(tmp_dir)
+            self.assertEqual(cfg.get_station_cameras(1)[0], raw_rtsp)
+
+            # Migrate / save -> on-disk JSON must encrypt password and NEVER contain 'CamSecretPass2026'
+            self.assertTrue(cfg.migrate_plaintext_credentials())
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                disk_text = f.read()
+            self.assertNotIn("CamSecretPass2026", disk_text)
+            self.assertIn("ENC[dpapi:", disk_text)
+
+            # Reload from encrypted config -> in-memory camera URL must decrypt back to original RTSP URL
+            cfg2 = Config(tmp_dir)
+            self.assertEqual(cfg2.get_station_cameras(1)[0], raw_rtsp)
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 

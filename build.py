@@ -49,13 +49,15 @@ VSVersionInfo(
     return version_file
 
 
-def build():
+def build(dist_root: str = "", sync_to_c_packstation: bool = True):
     base_dir = os.path.dirname(os.path.abspath(__file__))
     import imageio_ffmpeg
     ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
 
     # Generate version info to reduce AV false positives
     version_file = create_version_info(base_dir)
+    actual_dist_root = dist_root or os.path.join(base_dir, "dist")
+    work_root = os.path.join(os.path.dirname(actual_dist_root), "build_work") if dist_root else os.path.join(base_dir, "build")
 
     cmd = [
         sys.executable, "-m", "PyInstaller",
@@ -63,6 +65,9 @@ def build():
         "--onedir",
         "--windowed",
         "--name", "PackStation",
+        f"--distpath={actual_dist_root}",
+        f"--workpath={work_root}",
+        f"--specpath={actual_dist_root if dist_root else base_dir}",
         f"--add-data={os.path.join(base_dir, 'i18n')};i18n",
         f"--add-data={os.path.join(base_dir, 'audio')};audio",
         f"--add-data={os.path.join(base_dir, 'assets')};assets",
@@ -92,7 +97,7 @@ def build():
 
     if result.returncode == 0:
         print("\n✅ Build thành công!")
-        dist_dir = os.path.join(base_dir, "dist", "PackStation")
+        dist_dir = os.path.join(actual_dist_root, "PackStation")
         print(f"📁 Output: {dist_dir}")
 
         import shutil
@@ -129,39 +134,56 @@ def build():
         # Create logs directory for file logging
         os.makedirs(os.path.join(dist_dir, "logs"), exist_ok=True)
 
-        # Also sync to C:\PackStation
-        target_portable = r"C:\PackStation"
-        try:
-            # Backup existing database in C:\PackStation if present
-            target_db = os.path.join(target_portable, "packstation.db")
-            if os.path.exists(target_db):
-                import time
-                backup_db = os.path.join(target_portable, f"packstation_backup_{int(time.time())}.db")
-                try:
-                    shutil.copy2(target_db, backup_db)
-                    print(f"🛡️ Đã sao lưu Database hiện có: {backup_db}")
-                except Exception:
-                    pass
+        # Optionally sync to C:\PackStation if enabled
+        if sync_to_c_packstation:
+            target_portable = r"C:\PackStation"
+            try:
+                target_db = os.path.join(target_portable, "packstation.db")
+                if os.path.exists(target_db):
+                    import time
+                    from core.updater import backup_sqlite_database
+                    backup_db = os.path.join(target_portable, f"packstation_backup_{int(time.time())}.db")
+                    ok_bak, err_bak = backup_sqlite_database(target_db, backup_db)
+                    if ok_bak:
+                        print(f"🛡️ Đã sao lưu Database hiện có (SQLite Backup API): {backup_db}")
+                    else:
+                        print(f"⚠️ Cảnh báo sao lưu Database: {err_bak}")
 
-            for item in os.listdir(dist_dir):
-                # NEVER overwrite user database in target directory!
-                if item.lower() == "packstation.db":
-                    continue
-                s = os.path.join(dist_dir, item)
-                d = os.path.join(target_portable, item)
-                if os.path.isdir(s):
-                    shutil.copytree(s, d, dirs_exist_ok=True)
-                else:
-                    shutil.copy2(s, d)
-            print(f"✅ Đã đồng bộ sang {target_portable}")
-        except Exception as e:
-            print(f"⚠️ Đồng bộ sang C:\\PackStation: {e}")
+                protected_names = {
+                    "packstation.db",
+                    "packstation.db-wal",
+                    "packstation.db-shm",
+                    "packstation-config.json",
+                    "videos",
+                    "logs",
+                }
+                for item in os.listdir(dist_dir):
+                    if item.lower() in protected_names or item.lower().startswith("packstation_backup"):
+                        continue
+                    s = os.path.join(dist_dir, item)
+                    d = os.path.join(target_portable, item)
+                    if os.path.isdir(s):
+                        shutil.copytree(s, d, dirs_exist_ok=True)
+                    else:
+                        shutil.copy2(s, d)
+                print(f"✅ Đã đồng bộ sang {target_portable}")
+            except Exception as e:
+                print(f"⚠️ Đồng bộ sang C:\\PackStation: {e}")
 
         # Cleanup version info file
         if os.path.exists(version_file):
             os.remove(version_file)
     else:
         print(f"\n❌ Build thất bại (code {result.returncode})")
+        if os.path.exists(version_file):
+            os.remove(version_file)
+        sys.exit(result.returncode)
+
 
 if __name__ == "__main__":
-    build()
+    import argparse
+    parser = argparse.ArgumentParser(description="Build PackStation portable")
+    parser.add_argument("--dist-dir", default="", help="Custom output dist directory")
+    parser.add_argument("--no-sync", action="store_true", help="Do not sync build output to C:\\PackStation")
+    args = parser.parse_args()
+    build(dist_root=args.dist_dir, sync_to_c_packstation=not args.no_sync)

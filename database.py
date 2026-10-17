@@ -132,13 +132,40 @@ class Database:
             )
             self.conn.commit()
 
-    def delete_order(self, order_id: int, delete_video_files: bool = True) -> list:
+    def order_exists(self, order_id: int) -> bool:
+        with self._lock:
+            row = self.conn.execute("SELECT 1 FROM orders WHERE id=?", (order_id,)).fetchone()
+            return row is not None
+
+    def delete_order(self, order_id: int, delete_video_files: bool = True, active_order_ids: set = None) -> list:
         """Delete an order and its associated video/scan records from DB.
+        Refuses to delete orders that are currently 'packing' or 'finishing'.
         Optionally deletes physical video files from disk.
         Returns list of deleted video file paths.
         """
         deleted_files = []
         with self._lock:
+            order_row = self.conn.execute(
+                "SELECT id, order_sn, status FROM orders WHERE id=?", (order_id,)
+            ).fetchone()
+            if not order_row:
+                return []
+
+            status = (order_row["status"] or "").strip().lower()
+            if status in ("packing", "finishing") or (active_order_ids and order_id in active_order_ids):
+                raise ValueError(
+                    f"Không thể xóa đơn hàng '{order_row['order_sn']}' đang trong quá trình ghi hình ({status})."
+                )
+
+            rec_check = self.conn.execute(
+                "SELECT 1 FROM video_checks WHERE order_id=? AND status='recording' LIMIT 1",
+                (order_id,),
+            ).fetchone()
+            if rec_check and status not in ("completed", "cancelled", "crashed"):
+                raise ValueError(
+                    f"Không thể xóa đơn hàng '{order_row['order_sn']}' khi luồng video đang ghi."
+                )
+
             # 1. Fetch associated video paths before deleting records
             videos = self.conn.execute("SELECT filepath FROM videos WHERE order_id=?", (order_id,)).fetchall()
             for v in videos:
@@ -327,8 +354,11 @@ class Database:
             ).fetchall()
 
     # ── Videos ──
-    def add_video(self, order_id: int, filename: str, filepath: str, channel: int = 1) -> int:
+    def add_video(self, order_id: int, filename: str, filepath: str, channel: int = 1):
         with self._lock:
+            exists = self.conn.execute("SELECT 1 FROM orders WHERE id=?", (order_id,)).fetchone()
+            if not exists:
+                return None
             c = self.conn.execute(
                 "INSERT INTO videos (order_id, filename, filepath, camera_channel) VALUES (?, ?, ?, ?)",
                 (order_id, filename, filepath, channel),
@@ -337,6 +367,8 @@ class Database:
             return c.lastrowid
 
     def update_video_info(self, video_id: int, file_size: int, duration: float):
+        if not video_id:
+            return
         with self._lock:
             self.conn.execute(
                 "UPDATE videos SET file_size=?, duration_seconds=? WHERE id=?",
@@ -350,8 +382,11 @@ class Database:
                 "SELECT * FROM videos WHERE order_id=?", (order_id,)
             ).fetchall()
 
-    def set_video_check(self, order_id: int, channel: int, status: str, message: str = "", dropped_frames: int = 0):
+    def set_video_check(self, order_id: int, channel: int, status: str, message: str = "", dropped_frames: int = 0) -> bool:
         with self._lock:
+            exists = self.conn.execute("SELECT 1 FROM orders WHERE id=?", (order_id,)).fetchone()
+            if not exists:
+                return False
             self.conn.execute(
                 """INSERT INTO video_checks (order_id, camera_channel, status, message, dropped_frames)
                    VALUES (?, ?, ?, ?, ?)
@@ -362,6 +397,7 @@ class Database:
                 (order_id, channel, status, message, dropped_frames),
             )
             self.conn.commit()
+            return True
 
     def get_video_checks(self, order_id: int):
         with self._lock:
@@ -370,15 +406,26 @@ class Database:
             ).fetchall()
 
     def remove_videos_in_folder(self, folder_path: str) -> int:
-        """Remove video records whose files were inside folder_path."""
-        norm = os.path.normpath(folder_path)
+        """Remove video records whose files were inside folder_path AND have actually been deleted from disk."""
+        if not folder_path:
+            return 0
+        target_norm = os.path.normcase(os.path.normpath(os.path.abspath(folder_path)))
+        prefix_with_sep = target_norm + os.sep
         with self._lock:
-            c = self.conn.execute(
-                "DELETE FROM videos WHERE filepath LIKE ? OR filepath LIKE ?",
-                (f"{norm}%", f"{folder_path}%"),
-            )
-            self.conn.commit()
-            return c.rowcount
+            rows = self.conn.execute("SELECT id, filepath FROM videos").fetchall()
+            to_delete = []
+            for r in rows:
+                fp = r["filepath"]
+                if not fp:
+                    continue
+                fp_norm = os.path.normcase(os.path.normpath(os.path.abspath(fp)))
+                if fp_norm == target_norm or fp_norm.startswith(prefix_with_sep):
+                    if not os.path.exists(fp):
+                        to_delete.append((r["id"],))
+            if to_delete:
+                self.conn.executemany("DELETE FROM videos WHERE id=?", to_delete)
+                self.conn.commit()
+            return len(to_delete)
 
     def cleanup_missing_videos(self) -> int:
         """Scan videos table and delete records pointing to non-existent files on disk."""

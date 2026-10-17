@@ -80,6 +80,8 @@ def build(dist_root: str = "", sync_to_c_packstation: bool = True):
         "--hidden-import=PIL",
         "--hidden-import=cv2",
         "--hidden-import=openpyxl",
+        "--hidden-import=certifi",
+        "--collect-data=certifi",
         "--collect-all=customtkinter",
         "--collect-all=pyzbar",
         "--collect-all=zxingcpp",

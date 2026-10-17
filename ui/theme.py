@@ -15,6 +15,8 @@ COLORS = {
     "warning_bg": "#422006",
     "error": "#ef4444",
     "error_bg": "#450a0a",
+    "danger": "#ef4444",
+    "danger_bg": "#450a0a",
     "text_primary": "#e2e8f0",
     "text_secondary": "#94a3b8",
     "text_muted": "#64748b",

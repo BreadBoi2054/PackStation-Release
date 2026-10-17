@@ -902,6 +902,68 @@ class TestBarcodeFilter(unittest.TestCase):
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
+    def test_updater_version_comparison_and_data_safety(self):
+        """Test Auto-Updater version comparison, backup, and protection of DB/config/Videos."""
+        import tempfile
+        from core.updater import (
+            backup_user_data,
+            create_and_run_updater_script,
+            is_newer_version,
+            parse_version,
+            strip_protected_items,
+        )
+
+        self.assertEqual(parse_version("v1.5.4"), (1, 5, 4))
+        self.assertEqual(parse_version("1.5.4.0"), (1, 5, 4))
+        self.assertTrue(is_newer_version("v1.5.5", "v1.5.4"))
+        self.assertTrue(is_newer_version("v2.0.0", "v1.5.4"))
+        self.assertFalse(is_newer_version("v1.5.4", "v1.5.4"))
+        self.assertFalse(is_newer_version("v1.5.3", "v1.5.4"))
+
+        tmp_dir = tempfile.mkdtemp()
+        try:
+            # 1. Test backup_user_data
+            db_file = os.path.join(tmp_dir, "packstation.db")
+            cfg_file = os.path.join(tmp_dir, "packstation-config.json")
+            with open(db_file, "wb") as f:
+                f.write(b"important_sqlite_data")
+            with open(cfg_file, "w", encoding="utf-8") as f:
+                f.write('{"station_name": "Ban 1"}')
+
+            backups = backup_user_data(tmp_dir)
+            self.assertEqual(len(backups), 2)
+            for b in backups:
+                self.assertTrue(os.path.exists(b))
+
+            # 2. Test strip_protected_items removes DB, config, Videos, logs from staged folder
+            staged = os.path.join(tmp_dir, "staged")
+            os.makedirs(os.path.join(staged, "Videos"), exist_ok=True)
+            os.makedirs(os.path.join(staged, "logs"), exist_ok=True)
+            with open(os.path.join(staged, "packstation.db"), "wb") as f:
+                f.write(b"empty_release_db")
+            with open(os.path.join(staged, "packstation-config.json"), "w") as f:
+                f.write("{}")
+            with open(os.path.join(staged, "PackStation.exe"), "wb") as f:
+                f.write(b"new_exe_binary")
+
+            strip_protected_items(staged)
+            self.assertFalse(os.path.exists(os.path.join(staged, "packstation.db")))
+            self.assertFalse(os.path.exists(os.path.join(staged, "packstation-config.json")))
+            self.assertFalse(os.path.exists(os.path.join(staged, "Videos")))
+            self.assertFalse(os.path.exists(os.path.join(staged, "logs")))
+            self.assertTrue(os.path.exists(os.path.join(staged, "PackStation.exe")))
+
+            # 3. Test updater script generation without launching
+            bat_path = create_and_run_updater_script(staged, tmp_dir, launch_after=False)
+            self.assertTrue(os.path.exists(bat_path))
+            with open(bat_path, "r", encoding="utf-8") as f:
+                bat_text = f.read()
+            self.assertIn("robocopy", bat_text)
+            self.assertIn("packstation.db", bat_text)
+            self.assertIn("packstation-config.json", bat_text)
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
 
 if __name__ == "__main__":
     print("=" * 60)

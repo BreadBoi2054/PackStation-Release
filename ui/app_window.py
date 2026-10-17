@@ -1602,6 +1602,69 @@ class AppWindow(ctk.CTk):
             command=_update_pin_action
         ).pack(side="left")
 
+        # ── Software Update Card (GitHub) ──
+        from core.updater import CURRENT_VERSION
+        upd_card = ctk.CTkFrame(page, fg_color=COLORS["bg_card"], corner_radius=SIZES["border_radius"])
+        upd_card.pack(fill="x", pady=PADDING["sm"])
+
+        upd_header = ctk.CTkFrame(upd_card, fg_color="transparent")
+        upd_header.pack(fill="x", padx=PADDING["md"], pady=(PADDING["md"], PADDING["xs"]))
+        ctk.CTkLabel(
+            upd_header,
+            text="🚀 Cập nhật phần mềm (GitHub Release)",
+            font=FONTS["body_bold"],
+            text_color=COLORS["accent"],
+        ).pack(side="left")
+        ctk.CTkLabel(
+            upd_header,
+            text=f"Phiên bản hiện tại: {CURRENT_VERSION}",
+            font=FONTS["small_bold"],
+            text_color=COLORS["success"],
+        ).pack(side="right")
+
+        upd_inner = ctk.CTkFrame(upd_card, fg_color="transparent")
+        upd_inner.pack(fill="x", padx=PADDING["md"], pady=(0, PADDING["md"]))
+
+        self._update_status_label = ctk.CTkLabel(
+            upd_inner,
+            text="💡 Kiểm tra và tải bản cập nhật mới nhất trực tiếp từ GitHub (giữ nguyên 100% dữ liệu đơn hàng, video và cấu hình máy).",
+            font=FONTS["small"],
+            text_color=COLORS["text_secondary"],
+            justify="left",
+            wraplength=680,
+        )
+        self._update_status_label.pack(anchor="w", pady=(0, PADDING["xs"]))
+
+        self._update_progress_bar = ctk.CTkProgressBar(upd_inner, height=10, progress_color=COLORS["accent"])
+        self._update_progress_bar.set(0)
+
+        upd_btn_row = ctk.CTkFrame(upd_inner, fg_color="transparent")
+        upd_btn_row.pack(fill="x", pady=(PADDING["xs"], 0))
+
+        self._check_update_btn = ctk.CTkButton(
+            upd_btn_row,
+            text="🔄 Kiểm tra cập nhật",
+            font=FONTS["small_bold"],
+            width=160,
+            height=34,
+            fg_color="#2563eb",
+            hover_color="#1d4ed8",
+            command=self._on_check_for_update,
+        )
+        self._check_update_btn.pack(side="left", padx=(0, PADDING["sm"]))
+
+        self._apply_update_btn = ctk.CTkButton(
+            upd_btn_row,
+            text="⬇️ Tải & Cập nhật ngay",
+            font=FONTS["small_bold"],
+            width=190,
+            height=34,
+            fg_color=COLORS["success"],
+            hover_color="#15803d",
+            command=self._on_apply_update,
+        )
+        self._pending_update_info = None
+
         # Save button
         ctk.CTkButton(
             page, text=self._t("settings.save"), font=FONTS["body_bold"],
@@ -2788,6 +2851,184 @@ class AppWindow(ctk.CTk):
                 except Exception:
                     pass
         self._safe_dispatch(_ui_update)
+
+    # ═══════════════════════════════════════════
+    # AUTO-UPDATER (GITHUB)
+    # ═══════════════════════════════════════════
+    def _is_any_order_packing(self) -> bool:
+        """Return True if any station has an active or finishing order."""
+        if not hasattr(self, "order_mgr") or not self.order_mgr:
+            return False
+        active = getattr(self.order_mgr, "_active_orders", {})
+        finishing = getattr(self.order_mgr, "_finishing_orders", set())
+        return bool(active or finishing)
+
+    def _on_check_for_update(self):
+        """Check GitHub Releases for a newer version in a background thread."""
+        if self._is_any_order_packing():
+            self._update_status_label.configure(
+                text="⚠️ Đang có đơn hàng ghi hình! Vui lòng hoàn tất đơn trước khi kiểm tra hoặc cập nhật.",
+                text_color=COLORS["warning"],
+            )
+            return
+
+        self._check_update_btn.configure(state="disabled", text="⏳ Đang kiểm tra...")
+        self._apply_update_btn.pack_forget()
+        self._update_status_label.configure(
+            text="🔍 Đang kết nối tới GitHub để kiểm tra phiên bản mới...",
+            text_color=COLORS["text_secondary"],
+        )
+
+        def _worker():
+            from core.updater import check_for_update
+            info = check_for_update()
+
+            def _ui():
+                self._check_update_btn.configure(state="normal", text="🔄 Kiểm tra cập nhật")
+                if info.get("error"):
+                    self._update_status_label.configure(
+                        text=f"❌ {info['error']}",
+                        text_color=COLORS["danger"],
+                    )
+                    return
+
+                self._pending_update_info = info
+                latest_ver = info.get("latest_version", "")
+                if info.get("has_update"):
+                    notes = (info.get("release_notes") or "").strip()
+                    short_notes = notes[:220] + ("..." if len(notes) > 220 else "")
+                    msg = f"🎉 Đã có phiên bản mới: {latest_ver}"
+                    if short_notes:
+                        msg += f"\n📋 Nội dung: {short_notes}"
+                    self._update_status_label.configure(
+                        text=msg,
+                        text_color=COLORS["success"],
+                    )
+                    self._apply_update_btn.configure(text=f"⬇️ Tải & Cập nhật ({latest_ver})")
+                    self._apply_update_btn.pack(side="left")
+                else:
+                    git_dir = os.path.join(self.config.base_dir, ".git")
+                    if not getattr(sys, "frozen", False) and os.path.isdir(git_dir):
+                        self._update_status_label.configure(
+                            text=f"✅ Bạn đang ở bản Release mới nhất ({latest_ver}). Bạn cũng có thể kéo code mới nhất trực tiếp từ nhánh main (git pull).",
+                            text_color=COLORS["success"],
+                        )
+                        self._apply_update_btn.configure(text="⬇️ Đồng bộ từ Git (git pull)")
+                        self._apply_update_btn.pack(side="left")
+                    else:
+                        self._update_status_label.configure(
+                            text=f"✅ Bạn đang sử dụng phiên bản mới nhất ({latest_ver}).",
+                            text_color=COLORS["success"],
+                        )
+
+            self._safe_dispatch(_ui)
+
+        threading.Thread(target=_worker, daemon=True, name="CheckUpdateWorker").start()
+
+    def _on_apply_update(self):
+        """Download and apply the update safely (either via GitHub Release ZIP or git pull)."""
+        if self._is_any_order_packing():
+            self._update_status_label.configure(
+                text="⛔ Không thể cập nhật khi đang quay video đóng gói! Vui lòng kết thúc đơn hàng trước.",
+                text_color=COLORS["danger"],
+            )
+            return
+
+        info = self._pending_update_info or {}
+        is_frozen = getattr(sys, "frozen", False)
+        git_dir = os.path.join(self.config.base_dir, ".git")
+
+        self._check_update_btn.configure(state="disabled")
+        self._apply_update_btn.configure(state="disabled", text="⏳ Đang cập nhật...")
+        self._update_progress_bar.pack(fill="x", pady=(0, PADDING["xs"]))
+        self._update_progress_bar.set(0.05)
+
+        def _worker():
+            from core.updater import (
+                create_and_run_updater_script,
+                download_and_stage_update,
+                update_via_git_pull,
+            )
+
+            # Case 1: Running from source with .git and either no new release binary or user clicked git pull
+            if not is_frozen and os.path.isdir(git_dir) and not info.get("has_update"):
+                res = update_via_git_pull(self.config.base_dir)
+
+                def _ui_git():
+                    self._check_update_btn.configure(state="normal")
+                    self._apply_update_btn.configure(state="normal", text="⬇️ Đồng bộ từ Git (git pull)")
+                    self._update_progress_bar.set(1.0 if res["ok"] else 0)
+                    if res["ok"]:
+                        out = res.get("output") or "Already up to date."
+                        self._update_status_label.configure(
+                            text=f"✅ Đã cập nhật từ Git thành công ({out}). Vui lòng khởi động lại ứng dụng để áp dụng thay đổi.",
+                            text_color=COLORS["success"],
+                        )
+                        self._on_log("✅ Cập nhật mã nguồn từ Git thành công!", 0)
+                    else:
+                        self._update_status_label.configure(
+                            text=f"❌ Lỗi git pull: {res['error']}",
+                            text_color=COLORS["danger"],
+                        )
+
+                self._safe_dispatch(_ui_git)
+                return
+
+            # Case 2: Download Release ZIP package and stage update
+            download_url = info.get("download_url", "")
+            if not download_url:
+                def _ui_no_url():
+                    self._check_update_btn.configure(state="normal")
+                    self._apply_update_btn.configure(state="normal")
+                    self._update_status_label.configure(
+                        text="❌ Không tìm thấy gói tải về (.zip) trong bản Release này.",
+                        text_color=COLORS["danger"],
+                    )
+                self._safe_dispatch(_ui_no_url)
+                return
+
+            def _progress(pct: int, total: int, msg: str):
+                def _ui_prog():
+                    self._update_progress_bar.set(max(0.0, min(1.0, pct / float(total or 100))))
+                    self._update_status_label.configure(text=f"⏳ {msg}", text_color=COLORS["accent"])
+                self._safe_dispatch(_ui_prog)
+
+            stage_res = download_and_stage_update(
+                download_url=download_url,
+                target_dir=self.config.base_dir,
+                progress_callback=_progress,
+            )
+
+            if not stage_res.get("ok"):
+                def _ui_err():
+                    self._check_update_btn.configure(state="normal")
+                    self._apply_update_btn.configure(state="normal", text="⬇️ Thử cập nhật lại")
+                    self._update_status_label.configure(
+                        text=f"❌ Lỗi cập nhật: {stage_res.get('error')}",
+                        text_color=COLORS["danger"],
+                    )
+                self._safe_dispatch(_ui_err)
+                return
+
+            def _ui_finish_and_restart():
+                self._update_status_label.configure(
+                    text="✅ Tải hoàn tất! Đang áp dụng bản cập nhật và tự khởi động lại...",
+                    text_color=COLORS["success"],
+                )
+                self._on_log("🚀 Đang khởi động lại để hoàn tất cập nhật...", 0)
+                staged_dir = stage_res["staged_dir"]
+                self.cleanup()
+                create_and_run_updater_script(
+                    staged_source_dir=staged_dir,
+                    target_dir=self.config.base_dir,
+                    exe_name="PackStation.exe",
+                    launch_after=True,
+                )
+                self.destroy()
+
+            self._safe_dispatch(_ui_finish_and_restart)
+
+        threading.Thread(target=_worker, daemon=True, name="ApplyUpdateWorker").start()
 
     # ═══════════════════════════════════════════
     # CLEANUP

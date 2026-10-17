@@ -23,7 +23,7 @@ from core.logger import get_logger
 
 log = get_logger()
 
-CURRENT_VERSION = "v1.5.4"
+CURRENT_VERSION = "v1.5.5"
 GITHUB_REPO = "BreadBoi2054/PackStation-Release"
 
 # Never overwrite these files/folders during an update

@@ -18,8 +18,8 @@ def create_version_info(base_dir: str) -> str:
     content = """
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(1, 5, 4, 0),
-    prodvers=(1, 5, 4, 0),
+    filevers=(1, 5, 5, 0),
+    prodvers=(1, 5, 5, 0),
     mask=0x3f,
     flags=0x0,
     OS=0x40004,
@@ -33,12 +33,12 @@ VSVersionInfo(
         u'040904B0',
         [StringStruct(u'CompanyName', u'BA DUY - PackStation'),
          StringStruct(u'FileDescription', u'PackStation - Phan mem quan ly dong goi hang hoa'),
-         StringStruct(u'FileVersion', u'1.5.4.0'),
+         StringStruct(u'FileVersion', u'1.5.5.0'),
          StringStruct(u'InternalName', u'PackStation'),
          StringStruct(u'LegalCopyright', u'Copyright (c) 2024-2026 BA DUY. All rights reserved.'),
          StringStruct(u'OriginalFilename', u'PackStation.exe'),
          StringStruct(u'ProductName', u'PackStation'),
-         StringStruct(u'ProductVersion', u'1.5.4.0')])
+         StringStruct(u'ProductVersion', u'1.5.5.0')])
     ]),
     VarFileInfo([VarStruct(u'Translation', [1033, 1200])])
   ]

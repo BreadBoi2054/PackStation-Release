@@ -701,6 +701,77 @@ class TestBarcodeFilter(unittest.TestCase):
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
+    def test_rejects_6_digit_phantom_reads_and_noisy_formats(self):
+        """Ensure 6-digit phantom numbers and ITF/UPCE/EAN8 noise formats are rejected."""
+        from core.barcode_scanner import BarcodeScanner
+        for phantom in ["123456", "048291", "998877", "000123", "54321", "99"]:
+            self.assertFalse(
+                BarcodeScanner.is_valid_barcode(phantom, "BarcodeFormat.ITF"),
+                f"Failed to reject phantom number {phantom}"
+            )
+            self.assertFalse(
+                BarcodeScanner.is_valid_barcode(phantom, "BarcodeFormat.Code128"),
+                f"Failed to reject short numeric code {phantom}"
+            )
+        # Even longer numbers in noisy formats (ITF, UPCE, EAN8, CODABAR) must be rejected
+        for fmt in ["BarcodeFormat.ITF", "I25", "BarcodeFormat.UPCE", "EAN8", "CODABAR"]:
+            self.assertFalse(
+                BarcodeScanner.is_valid_barcode("1234567890", fmt),
+                f"Failed to reject noisy format {fmt}"
+            )
+
+    def test_scan_entry_no_duplicate_character_when_focused(self):
+        """Ensure _on_global_key does not duplicate characters when _scan_entry._entry has focus."""
+        from ui.app_window import AppWindow
+
+        class DummyInnerEntry:
+            def winfo_toplevel(self):
+                return None
+
+        class DummyScanEntry:
+            def __init__(self):
+                self._entry = DummyInnerEntry()
+                self.inserted = []
+                self.focused = False
+
+            def winfo_exists(self):
+                return True
+
+            def focus_set(self):
+                self.focused = True
+
+            def insert(self, pos, char):
+                self.inserted.append(char)
+
+        class DummyWindow:
+            _current_page = "camera"
+            _is_scan_entry_widget = AppWindow._is_scan_entry_widget
+            _is_text_input_widget = AppWindow._is_text_input_widget
+            _on_global_key = AppWindow._on_global_key
+
+            def __init__(self):
+                self._scan_entry = DummyScanEntry()
+                self._focused = self._scan_entry._entry
+
+            def focus_get(self):
+                return self._focused
+
+        class DummyEvent:
+            keysym = "a"
+            char = "a"
+            state = 0
+
+        win = DummyWindow()
+        # 1. When internal _scan_entry._entry already has focus, _on_global_key must NOT insert again
+        win._on_global_key(DummyEvent())
+        self.assertEqual(win._scan_entry.inserted, [])
+
+        # 2. When nothing is focused (e.g. user clicked background frame), _on_global_key focuses and inserts once
+        win._focused = None
+        win._on_global_key(DummyEvent())
+        self.assertEqual(win._scan_entry.inserted, ["a"])
+        self.assertTrue(win._scan_entry.focused)
+
     def test_delayed_stop_cancellation_does_not_stop_new_order(self):
         """Test Requirement 1: If delayed stop is cancelled and a new order starts, the old timer must NOT stop the new order."""
         import tempfile

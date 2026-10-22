@@ -2,6 +2,7 @@
 
 Optimized for weak hardware (i3 gen 5):
 - ZXing C++ prioritized: 1-3ms scan time, ultra-low CPU, robust against skew/distortion
+- Strict barcode format whitelist (Code128, Code39, Code93, QRCode, DataMatrix, EAN13) to prevent 6-digit phantom reads from empty camera noise
 - Pyzbar and OpenCV QRCodeDetector as graceful fallbacks
 - Extended cooldown for function codes (STOP, KETTHUC) to prevent repeated triggers
 """
@@ -14,14 +15,31 @@ from typing import Callable, Optional
 try:
     import zxingcpp
     HAS_ZXING = True
+    _ZXING_FORMATS = (
+        zxingcpp.BarcodeFormat.Code128
+        | zxingcpp.BarcodeFormat.Code39
+        | zxingcpp.BarcodeFormat.Code93
+        | zxingcpp.BarcodeFormat.QRCode
+        | zxingcpp.BarcodeFormat.DataMatrix
+        | zxingcpp.BarcodeFormat.EAN13
+    )
 except ImportError:
     HAS_ZXING = False
+    _ZXING_FORMATS = None
 
 try:
-    from pyzbar.pyzbar import decode as pyzbar_decode
+    from pyzbar.pyzbar import decode as pyzbar_decode, ZBarSymbol
     HAS_PYZBAR = True
+    _PYZBAR_SYMBOLS = [
+        ZBarSymbol.CODE128,
+        ZBarSymbol.CODE39,
+        ZBarSymbol.CODE93,
+        ZBarSymbol.QRCODE,
+        ZBarSymbol.EAN13,
+    ]
 except ImportError:
     HAS_PYZBAR = False
+    _PYZBAR_SYMBOLS = None
 
 
 class BarcodeScanner:
@@ -62,16 +80,18 @@ class BarcodeScanner:
 
     @staticmethod
     def is_valid_barcode(code_text: str, code_type: str = "") -> bool:
-        """Filter out web URLs, ad links, and promotional QR codes.
+        """Filter out web URLs, ad links, promotional QR codes, and 6-digit camera noise phantom reads.
         
         Allows:
-        1. 1D linear barcodes (Code 128, Code 39, EAN) for shipping tracking numbers.
+        1. 1D linear barcodes (Code 128, Code 39, EAN-13) for shipping tracking numbers.
         2. 2D QR codes containing actual shipping tracking numbers (Shopee SPX, TikTok, J&T, Viettel Post).
         3. Function commands (STOP, END, KETTHUC, DUNG, CANCEL, HUY, SETCA, MANUAL, DONTHUCONG, TC_).
         
         Rejects:
         1. Web URLs (http://, https://, ftp://, www., etc.)
         2. Promotional/ad domains (tiktok.com, tiktok.shop, shopee.vn, etc.)
+        3. Noisy 1D symbologies (ITF / I25, UPC-E, EAN-8, Codabar, DataBar)
+        4. Short pure-digit phantom numbers (< 8 digits, e.g. 6-digit noise) and non-function strings < 6 chars
         """
         text = (code_text or "").strip()
         if not text or len(text) < 2:
@@ -91,6 +111,34 @@ class BarcodeScanner:
             return False
         if any(d in lower for d in ("tiktok.com", "tiktok.shop", "shopee.vn", "shope.ee", "bit.ly", "tinyurl.com")):
             return False
+
+        # 3. Check if this is a known system function code
+        upper = text.upper()
+        clean_alnum = "".join(ch for ch in upper if ch.isalnum())
+        func_tokens = {
+            "STOP", "END", "ENDTIME", "KETTHUC", "DUNG", "DUNGQUAY",
+            "STOPORDER", "HOANTHANH", "TAMDUNG", "FINISH", "DONE",
+            "CANCEL", "HUY", "HUYDON", "ABORT", "DELETE",
+            "MANUAL", "DONTHUCONG", "THUCONG",
+        }
+        func_prefixes = (
+            "KETTHUC", "STOP", "ENDTIME", "HUY", "CANCEL",
+            "SETCA", "SHIFT", "DONTHUCONG", "TC_",
+        )
+        is_func = clean_alnum in func_tokens or upper.startswith(func_prefixes)
+
+        if not is_func:
+            # 4. Reject noisy 1D formats prone to 6-digit phantom reads on empty camera frames
+            fmt_upper = (code_type or "").upper()
+            noisy_formats = ("ITF", "I25", "UPCE", "UPC_E", "UPC-E", "EAN8", "EAN_8", "EAN-8", "CODABAR", "DATABAR")
+            if any(nf in fmt_upper for nf in noisy_formats):
+                return False
+
+            # 5. Reject short pure-digit phantom numbers (< 8 digits, e.g. 6-digit noise) and short non-function strings (< 6 chars)
+            if text.isdigit() and len(text) < 8:
+                return False
+            if len(text) < 6:
+                return False
 
         return True
 
@@ -145,32 +193,23 @@ class BarcodeScanner:
         gray = cv2.cvtColor(scan_frame, cv2.COLOR_BGR2GRAY)
         results = []
 
-        # 1. 🚀 Priority: ZXing C++ (10x faster, ~1-3ms CPU time, native binarization)
+        # 1. 🚀 Priority: ZXing C++ (10x faster, ~1-3ms CPU time, native binarization, strict format whitelist)
         if HAS_ZXING:
             try:
-                decoded = zxingcpp.read_barcodes(gray)
+                decoded = zxingcpp.read_barcodes(gray, formats=_ZXING_FORMATS)
                 for d in decoded:
                     text = d.text.strip()
                     fmt = str(d.format)
                     if text and self.is_valid_barcode(text, fmt):
                         results.append((text, fmt))
-                if results:
-                    return results
+                return results
             except Exception:
                 pass
 
-        # 2. 🐢 Fallback: pyzbar (only if zxing didn't find anything or is unavailable)
-        if HAS_PYZBAR:
+        # 2. 🐢 Fallback: pyzbar (only when zxingcpp is unavailable; never use adaptiveThreshold noise amplifier)
+        if not HAS_ZXING and HAS_PYZBAR:
             try:
-                # Try simple grayscale first (fast)
-                decoded = pyzbar_decode(gray)
-                if not decoded:
-                    # Only calculate expensive adaptiveThreshold if grayscale fails
-                    enhanced = cv2.adaptiveThreshold(
-                        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 21, 5
-                    )
-                    decoded = pyzbar_decode(enhanced)
-
+                decoded = pyzbar_decode(gray, symbols=_PYZBAR_SYMBOLS)
                 for d in decoded:
                     text = d.data.decode("utf-8", errors="replace").strip()
                     fmt = str(d.type)

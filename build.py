@@ -18,8 +18,8 @@ def create_version_info(base_dir: str) -> str:
     content = """
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(1, 5, 6, 0),
-    prodvers=(1, 5, 6, 0),
+    filevers=(1, 5, 7, 0),
+    prodvers=(1, 5, 7, 0),
     mask=0x3f,
     flags=0x0,
     OS=0x40004,
@@ -33,12 +33,12 @@ VSVersionInfo(
         u'040904B0',
         [StringStruct(u'CompanyName', u'BA DUY - PackStation'),
          StringStruct(u'FileDescription', u'PackStation - Phan mem quan ly dong goi hang hoa'),
-         StringStruct(u'FileVersion', u'1.5.6.0'),
+         StringStruct(u'FileVersion', u'1.5.7.0'),
          StringStruct(u'InternalName', u'PackStation'),
          StringStruct(u'LegalCopyright', u'Copyright (c) 2024-2026 BA DUY. All rights reserved.'),
          StringStruct(u'OriginalFilename', u'PackStation.exe'),
          StringStruct(u'ProductName', u'PackStation'),
-         StringStruct(u'ProductVersion', u'1.5.6.0')])
+         StringStruct(u'ProductVersion', u'1.5.7.0')])
     ]),
     VarFileInfo([VarStruct(u'Translation', [1033, 1200])])
   ]
@@ -145,7 +145,9 @@ def build(dist_root: str = "", sync_to_c_packstation: bool = True):
                     import time
                     from core.updater import backup_sqlite_database
                     backup_db = os.path.join(target_portable, f"packstation_backup_{int(time.time())}.db")
-                    ok_bak, err_bak = backup_sqlite_database(target_db, backup_db)
+                    bak_res = backup_sqlite_database(target_db, backup_db)
+                    ok_bak = bak_res.get("ok") if isinstance(bak_res, dict) else bool(bak_res)
+                    err_bak = bak_res.get("error", "") if isinstance(bak_res, dict) else ""
                     if ok_bak:
                         print(f"🛡️ Đã sao lưu Database hiện có (SQLite Backup API): {backup_db}")
                     else:

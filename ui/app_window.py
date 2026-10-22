@@ -468,6 +468,7 @@ class AppWindow(ctk.CTk):
         )
         self._scan_entry.pack(side="left", fill="x", expand=True, padx=(0, PADDING["sm"]))
         self._scan_entry.bind("<Return>", self._on_manual_scan)
+        self._scan_entry.bind("<KP_Enter>", self._on_manual_scan)
 
         # Recording indicator
         self._record_indicator = ctk.CTkLabel(
@@ -2572,11 +2573,12 @@ class AppWindow(ctk.CTk):
 
         if self._current_page == "camera":
             focused = self.focus_get()
-            if not isinstance(focused, ctk.CTkEntry) and hasattr(self, "_scan_entry") and self._scan_entry.winfo_exists():
-                try:
-                    self._scan_entry.focus_set()
-                except Exception:
-                    pass
+            if not self._is_text_input_widget(focused) and hasattr(self, "_scan_entry") and self._scan_entry.winfo_exists():
+                if not focused or focused.winfo_toplevel() is self:
+                    try:
+                        self._scan_entry.focus_set()
+                    except Exception:
+                        pass
         self._status_timer = self.after(1000, self._start_status_loop)
 
     def _update_cameras(self):
@@ -2732,14 +2734,50 @@ class AppWindow(ctk.CTk):
             except Exception:
                 pass
 
+    def _is_scan_entry_widget(self, widget) -> bool:
+        """Return True if widget is _scan_entry or its internal tk.Entry."""
+        if not widget or not hasattr(self, "_scan_entry") or not self._scan_entry:
+            return False
+        inner = getattr(self._scan_entry, "_entry", None)
+        return widget is self._scan_entry or (inner is not None and widget is inner)
+
+    def _is_text_input_widget(self, widget) -> bool:
+        """Return True if widget is any Entry or Text widget (CTk or internal tk widget)."""
+        if not widget:
+            return False
+        import tkinter as tk
+        if isinstance(widget, (ctk.CTkEntry, ctk.CTkTextbox, tk.Entry, tk.Text)):
+            return True
+        master = getattr(widget, "master", None)
+        if isinstance(master, (ctk.CTkEntry, ctk.CTkTextbox)):
+            return True
+        return False
+
     def _on_global_key(self, event):
         """Global key interceptor so barcode scanners work even if click focus was elsewhere."""
         if event.keysym in ("F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12"):
             return
 
-        focused = self.focus_get()
-        if focused and isinstance(focused, ctk.CTkEntry) and focused != getattr(self, "_scan_entry", None):
+        # Ignore modifier shortcuts (Ctrl+..., Alt+...)
+        if getattr(event, "state", 0) & 0x4 or getattr(event, "state", 0) & 0x20000:
             return
+
+        focused = self.focus_get()
+
+        # CRITICAL FIX: In CustomTkinter, self.focus_get() returns self._scan_entry._entry (a tk.Entry),
+        # NOT self._scan_entry (the CTkEntry wrapper). If _scan_entry (or any other text input / dialog)
+        # already has focus, do NOT re-insert event.char or re-trigger Enter, otherwise every typed
+        # character is duplicated!
+        if self._is_scan_entry_widget(focused):
+            return
+        if self._is_text_input_widget(focused):
+            return
+        if focused is not None:
+            try:
+                if focused.winfo_toplevel() is not self:
+                    return
+            except Exception:
+                pass
 
         if self._current_page != "camera":
             return
@@ -2748,8 +2786,8 @@ class AppWindow(ctk.CTk):
             self._on_manual_scan()
             return
 
-        if event.char and event.char.isprintable() and hasattr(self, "_scan_entry") and self._scan_entry.winfo_exists():
-            if focused != self._scan_entry:
+        if event.char and len(event.char) == 1 and event.char.isprintable() and ord(event.char) >= 32:
+            if hasattr(self, "_scan_entry") and self._scan_entry.winfo_exists():
                 self._scan_entry.focus_set()
                 self._scan_entry.insert("end", event.char)
 

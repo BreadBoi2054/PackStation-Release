@@ -9,13 +9,18 @@ import sys
 import subprocess
 from datetime import datetime, date
 from PIL import Image, ImageTk
-from typing import Optional
+from typing import Callable, Optional
 
-from ui.theme import COLORS, FONTS, PADDING, SIZES
+from ui.theme import COLORS, FONTS, PADDING, SIZES, THEMES, apply_theme, get_current_theme
 from core.camera_manager import CameraManager
 from core.barcode_scanner import BarcodeScanner
 from core.video_recorder import VideoRecorder
-from core.zalo_export import export_for_zalo
+from core.zalo_export import (
+    EXPORT_LABEL_TO_PRESET,
+    EXPORT_PRESETS,
+    export_for_platform,
+    export_for_zalo,
+)
 from core.order_manager import OrderManager
 from core.audio_manager import AudioManager
 from core.logger import get_logger
@@ -65,11 +70,16 @@ class AppWindow(ctk.CTk):
         # Initialize core systems
         self.camera_mgr = CameraManager()
         self.audio = AudioManager(config.audio_dir, config.get("sound_enabled", True))
-        self.recorder = VideoRecorder(config.video_dir, db=db)
+        self.recorder = VideoRecorder(
+            config.video_dir,
+            db=db,
+            pre_roll_seconds=config.get("pre_roll_seconds", 3),
+        )
         self.order_mgr = OrderManager(db, config, self.recorder, self.audio)
         self.barcode_scanner = BarcodeScanner(
             on_code=self._on_barcode_detected,
-            interval_ms=config.get("auto_scan_interval_ms", 1000)
+            interval_ms=config.get("auto_scan_interval_ms", 1000),
+            is_packing=lambda: self.order_mgr.get_active_order(1) is not None,
         )
 
         # Order manager callbacks
@@ -125,6 +135,7 @@ class AppWindow(ctk.CTk):
 
     def _auto_sync_videos(self):
         try:
+            self.recorder.recover_interrupted_recordings()
             res = self.db.sync_videos_from_folder(self.config.video_dir)
             if res.get("orders_created", 0) > 0 or res.get("videos_linked", 0) > 0:
                 log.info(f"[Sync] 🔄 Khôi phục {res['orders_created']} đơn, {res['videos_linked']} video từ thư mục")
@@ -164,7 +175,7 @@ class AppWindow(ctk.CTk):
 
         ctk.CTkLabel(
             title_frame, text="BA DUY",
-            font=("Segoe UI", 15, "bold"), text_color="#f59e0b"
+            font=("Segoe UI", 15, "bold"), text_color=COLORS["brand_title"]
         ).pack(anchor="w")
         ctk.CTkLabel(
             title_frame, text="PackStation",
@@ -198,7 +209,12 @@ class AppWindow(ctk.CTk):
         spacer = ctk.CTkFrame(self._sidebar, fg_color="transparent")
         spacer.pack(fill="both", expand=True)
 
-        station_frame = ctk.CTkFrame(self._sidebar, fg_color=COLORS["bg_card"], corner_radius=8)
+        station_frame = ctk.CTkFrame(
+            self._sidebar, fg_color=COLORS["bg_card"],
+            corner_radius=SIZES["border_radius"],
+            border_width=SIZES.get("card_border_width", 0),
+            border_color=COLORS["border"]
+        )
         station_frame.pack(fill="x", padx=PADDING["sm"], pady=PADDING["md"])
         ctk.CTkLabel(
             station_frame, text=self._t("scan.station", number=1),
@@ -366,10 +382,17 @@ class AppWindow(ctk.CTk):
         self._cam_labels.clear()
         self._cam_badges.clear()
 
+        border_w = SIZES.get("card_border_width", 0)
+
         if not valid_cams:
             # 1 placeholder card
-            card = ctk.CTkFrame(camera_frame, fg_color=COLORS["bg_card"], corner_radius=SIZES["border_radius"])
+            card = ctk.CTkFrame(
+                camera_frame, fg_color=COLORS["bg_card"],
+                corner_radius=SIZES["border_radius"],
+                border_width=border_w, border_color=COLORS["border"]
+            )
             card.pack(fill="both", expand=True)
+            card.pack_propagate(False)
             hdr = ctk.CTkFrame(card, fg_color="transparent")
             hdr.pack(fill="x", padx=PADDING["sm"], pady=(PADDING["sm"], 0))
             ctk.CTkLabel(hdr, text="📷 Cam 1", font=FONTS["body_bold"], text_color=COLORS["text_primary"]).pack(side="left")
@@ -380,8 +403,13 @@ class AppWindow(ctk.CTk):
             self._cam_labels["cam1"] = lbl
             self._cam_badges["cam1"] = badge
         elif count == 1:
-            card = ctk.CTkFrame(camera_frame, fg_color=COLORS["bg_card"], corner_radius=SIZES["border_radius"])
+            card = ctk.CTkFrame(
+                camera_frame, fg_color=COLORS["bg_card"],
+                corner_radius=SIZES["border_radius"],
+                border_width=border_w, border_color=COLORS["border"]
+            )
             card.pack(fill="both", expand=True)
+            card.pack_propagate(False)
             hdr = ctk.CTkFrame(card, fg_color="transparent")
             hdr.pack(fill="x", padx=PADDING["sm"], pady=(PADDING["sm"], 0))
             ctk.CTkLabel(hdr, text="📷 Cam 1", font=FONTS["body_bold"], text_color=COLORS["text_primary"]).pack(side="left")
@@ -397,8 +425,13 @@ class AppWindow(ctk.CTk):
                 cam_key = f"cam{i+1}"
                 pad_left = 0 if i == 0 else PADDING["xs"]
                 pad_right = 0 if i == count - 1 else PADDING["xs"]
-                card = ctk.CTkFrame(camera_frame, fg_color=COLORS["bg_card"], corner_radius=SIZES["border_radius"])
+                card = ctk.CTkFrame(
+                    camera_frame, fg_color=COLORS["bg_card"],
+                    corner_radius=SIZES["border_radius"],
+                    border_width=border_w, border_color=COLORS["border"]
+                )
                 card.pack(side="left", fill="both", expand=True, padx=(pad_left, pad_right))
+                card.pack_propagate(False)
 
                 hdr = ctk.CTkFrame(card, fg_color="transparent")
                 hdr.pack(fill="x", padx=PADDING["sm"], pady=(PADDING["sm"], 0))
@@ -413,16 +446,21 @@ class AppWindow(ctk.CTk):
         else:
             # Grid layout for 4+ cameras
             cols = 2 if count <= 4 else 3
-            camera_frame.grid_columnconfigure(list(range(cols)), weight=1)
+            camera_frame.grid_columnconfigure(list(range(cols)), weight=1, uniform="cam_col")
             rows = (count + cols - 1) // cols
-            camera_frame.grid_rowconfigure(list(range(rows)), weight=1)
+            camera_frame.grid_rowconfigure(list(range(rows)), weight=1, uniform="cam_row")
 
             for i in range(count):
                 cam_key = f"cam{i+1}"
                 r = i // cols
                 c = i % cols
-                card = ctk.CTkFrame(camera_frame, fg_color=COLORS["bg_card"], corner_radius=SIZES["border_radius"])
+                card = ctk.CTkFrame(
+                    camera_frame, fg_color=COLORS["bg_card"],
+                    corner_radius=SIZES["border_radius"],
+                    border_width=border_w, border_color=COLORS["border"]
+                )
                 card.grid(row=r, column=c, sticky="nsew", padx=PADDING["xs"], pady=PADDING["xs"])
+                card.grid_propagate(False)
 
                 hdr = ctk.CTkFrame(card, fg_color="transparent")
                 hdr.pack(fill="x", padx=PADDING["sm"], pady=(PADDING["sm"], 0))
@@ -450,7 +488,12 @@ class AppWindow(ctk.CTk):
         bottom_frame.pack(fill="x", pady=(PADDING["md"], 0))
 
         # Current scan info
-        scan_card = ctk.CTkFrame(bottom_frame, fg_color=COLORS["bg_card"], corner_radius=SIZES["border_radius"])
+        scan_card = ctk.CTkFrame(
+            bottom_frame, fg_color=COLORS["bg_card"],
+            corner_radius=SIZES["border_radius"],
+            border_width=SIZES.get("card_border_width", 0),
+            border_color=COLORS["border"]
+        )
         scan_card.pack(fill="x", pady=(0, PADDING["sm"]))
 
         scan_inner = ctk.CTkFrame(scan_card, fg_color="transparent")
@@ -463,6 +506,7 @@ class AppWindow(ctk.CTk):
         self._scan_entry = ctk.CTkEntry(
             input_frame, placeholder_text=self._t("scan.placeholder"),
             font=FONTS["mono_large"], height=48,
+            corner_radius=SIZES["border_radius"],
             fg_color=COLORS["bg_input"], border_color=COLORS["border"],
             text_color=COLORS["text_primary"]
         )
@@ -487,27 +531,36 @@ class AppWindow(ctk.CTk):
         # Duplicate order action banner (hidden by default)
         self._last_duplicate_order_sn = None
         self._dup_timer = None
-        self._dup_frame = ctk.CTkFrame(scan_inner, fg_color="#451a03", corner_radius=SIZES["border_radius"], border_width=1, border_color="#d97706")
+        self._dup_frame = ctk.CTkFrame(
+            scan_inner, fg_color=COLORS["dup_bg"],
+            corner_radius=SIZES["border_radius"],
+            border_width=1, border_color=COLORS["dup_border"]
+        )
 
         dup_content = ctk.CTkFrame(self._dup_frame, fg_color="transparent")
         dup_content.pack(fill="x", padx=PADDING["md"], pady=PADDING["sm"])
 
         self._dup_label = ctk.CTkLabel(
             dup_content, text="⚠️ Đơn trùng:",
-            font=FONTS["body_bold"], text_color="#fbbf24"
+            font=FONTS["body_bold"], text_color=COLORS["dup_text"]
         )
         self._dup_label.pack(side="left", padx=(0, PADDING["md"]))
 
         self._dup_btn = ctk.CTkButton(
             dup_content, text="🔄 Quay lại đơn này (F2)",
-            font=FONTS["body_bold"], height=36,
-            fg_color="#d97706", hover_color="#b45309", text_color="#ffffff",
+            font=FONTS["body_bold"], height=36, corner_radius=SIZES["border_radius"],
+            fg_color=COLORS["dup_btn"], hover_color=COLORS["dup_btn_hover"], text_color="#ffffff",
             command=self._force_record_duplicate_order
         )
         self._dup_btn.pack(side="right")
 
         # Log area
-        log_card = ctk.CTkFrame(bottom_frame, fg_color=COLORS["bg_card"], corner_radius=SIZES["border_radius"], height=120)
+        log_card = ctk.CTkFrame(
+            bottom_frame, fg_color=COLORS["bg_card"],
+            corner_radius=SIZES["border_radius"], height=120,
+            border_width=SIZES.get("card_border_width", 0),
+            border_color=COLORS["border"]
+        )
         log_card.pack(fill="x")
         log_card.pack_propagate(False)
 
@@ -584,7 +637,12 @@ class AppWindow(ctk.CTk):
         self._filter_date_menu.pack(side="left")
 
         # 2. Search Card
-        search_card = ctk.CTkFrame(page, fg_color=COLORS["bg_card"], corner_radius=SIZES["border_radius"])
+        search_card = ctk.CTkFrame(
+            page, fg_color=COLORS["bg_card"],
+            corner_radius=SIZES["border_radius"],
+            border_width=SIZES.get("card_border_width", 0),
+            border_color=COLORS["border"]
+        )
         search_card.pack(fill="x", pady=(0, PADDING["sm"]))
 
         inner_search = ctk.CTkFrame(search_card, fg_color="transparent")
@@ -593,7 +651,8 @@ class AppWindow(ctk.CTk):
         self._order_search_entry = ctk.CTkEntry(
             inner_search,
             placeholder_text="🔍 Nhập mã vận đơn (Shopee, Lazada, TikTok...) hoặc ngày (YYYY-MM-DD) để tra nhanh...",
-            font=FONTS["body"], height=38, fg_color=COLORS["bg_input"],
+            font=FONTS["body"], height=38, corner_radius=SIZES["border_radius"],
+            fg_color=COLORS["bg_input"],
             border_color=COLORS["border"], text_color=COLORS["text_primary"]
         )
         self._order_search_entry.pack(side="left", fill="x", expand=True, padx=(0, PADDING["sm"]))
@@ -602,27 +661,30 @@ class AppWindow(ctk.CTk):
 
         ctk.CTkButton(
             inner_search, text="🔍 Tìm", font=FONTS["body_bold"],
-            width=80, height=38, fg_color=COLORS["accent"], hover_color=COLORS["accent_hover"],
+            width=80, height=38, corner_radius=SIZES["border_radius"],
+            fg_color=COLORS["accent"], hover_color=COLORS["accent_hover"],
             command=self._refresh_orders_list
         ).pack(side="left", padx=(0, PADDING["xs"]))
 
         ctk.CTkButton(
             inner_search, text="✕ Đặt lại", font=FONTS["body"],
-            width=75, height=38, fg_color="transparent", border_width=1,
+            width=75, height=38, corner_radius=SIZES["border_radius"],
+            fg_color="transparent", border_width=1,
             border_color=COLORS["border"], text_color=COLORS["text_secondary"],
             command=self._clear_orders_search
         ).pack(side="left")
 
         ctk.CTkButton(
             inner_search, text="🔄 Quét khôi phục video", font=FONTS["body_bold"],
-            height=38, fg_color="#059669", hover_color="#047857", text_color="#ffffff",
+            height=38, corner_radius=SIZES["border_radius"],
+            fg_color=COLORS["btn_export"], hover_color=COLORS["btn_export_hover"], text_color="#ffffff",
             command=self._manual_sync_videos
         ).pack(side="left", padx=(PADDING["sm"], 0))
 
         # 3. Selected Order Action Card (Banner)
         self._selected_order_bar = ctk.CTkFrame(
-            page, fg_color="#1e293b", corner_radius=SIZES["border_radius"],
-            border_width=1, border_color="#334155"
+            page, fg_color=COLORS["banner_bg"], corner_radius=SIZES["border_radius"],
+            border_width=1, border_color=COLORS["banner_border"]
         )
         self._selected_order_bar.pack(fill="x", pady=(0, PADDING["sm"]))
 
@@ -649,31 +711,54 @@ class AppWindow(ctk.CTk):
 
         self._open_folder_btn = ctk.CTkButton(
             bar_btns, text="📁 Mở video (Folder)",
-            font=FONTS["body_bold"], height=38,
-            fg_color="#0284c7", hover_color="#0369a1", text_color="#ffffff",
+            font=FONTS["body_bold"], height=38, corner_radius=SIZES["border_radius"],
+            fg_color=COLORS["btn_folder"], hover_color=COLORS["btn_folder_hover"], text_color="#ffffff",
             state="disabled",
             command=lambda: self._open_order_video_in_folder(self._selected_order)
         )
         self._open_folder_btn.pack(side="left", padx=(0, PADDING["xs"]))
 
+        self._export_preset_var = ctk.StringVar(value=EXPORT_PRESETS["shopee_30"]["label"])
+        self._export_preset_menu = ctk.CTkOptionMenu(
+            bar_btns,
+            variable=self._export_preset_var,
+            values=[cfg["label"] for cfg in EXPORT_PRESETS.values()],
+            width=155, height=38,
+            corner_radius=SIZES["border_radius"],
+            font=FONTS["small_bold"],
+            dropdown_font=FONTS["small"],
+            fg_color=COLORS["bg_input"],
+            button_color=COLORS["border"],
+            button_hover_color=COLORS["accent"],
+            dropdown_fg_color=COLORS["bg_secondary"],
+            dropdown_hover_color=COLORS["accent_hover"],
+        )
+        self._export_preset_menu.pack(side="left", padx=(0, PADDING["xs"]))
+
         self._zalo_export_btn = ctk.CTkButton(
-            bar_btns, text="🎬 Xuất gửi Zalo", font=FONTS["body_bold"], height=38,
-            fg_color="#059669", hover_color="#047857", text_color="#ffffff",
+            bar_btns, text="🎬 Xuất Video", font=FONTS["body_bold"], height=38,
+            corner_radius=SIZES["border_radius"],
+            fg_color=COLORS["btn_export"], hover_color=COLORS["btn_export_hover"], text_color="#ffffff",
             state="disabled", command=self._export_selected_order_for_zalo
         )
         self._zalo_export_btn.pack(side="left", padx=(0, PADDING["xs"]))
 
         self._delete_order_btn = ctk.CTkButton(
             bar_btns, text="🗑️ Xóa đơn",
-            font=FONTS["body_bold"], height=38,
-            fg_color="#ef4444", hover_color="#dc2626", text_color="#ffffff",
+            font=FONTS["body_bold"], height=38, corner_radius=SIZES["border_radius"],
+            fg_color=COLORS["error"], hover_color=COLORS["recording_pulse"], text_color="#ffffff",
             state="disabled",
             command=lambda: self._confirm_delete_order(self._selected_order)
         )
         self._delete_order_btn.pack(side="left")
 
         # 4. Orders List Scrollable Frame
-        self._orders_list_frame = ctk.CTkScrollableFrame(page, fg_color=COLORS["bg_card"], corner_radius=SIZES["border_radius"])
+        self._orders_list_frame = ctk.CTkScrollableFrame(
+            page, fg_color=COLORS["bg_card"],
+            corner_radius=SIZES["border_radius"],
+            border_width=SIZES.get("card_border_width", 0),
+            border_color=COLORS["border"]
+        )
         self._orders_list_frame.pack(fill="both", expand=True)
 
         # Initial populate
@@ -920,10 +1005,10 @@ class AppWindow(ctk.CTk):
         export_time = order.get("video_export_time") or order.get("end_time") or ""
         if status == "packing":
             export_display = "🔴 Đang quay..."
-            export_color = "#f59e0b"
+            export_color = COLORS["warning"]
         elif export_time:
             export_display = export_time
-            export_color = "#38bdf8"
+            export_color = COLORS["accent_hover"]
         else:
             export_display = "---"
             export_color = COLORS["text_muted"]
@@ -943,7 +1028,7 @@ class AppWindow(ctk.CTk):
             v_color = COLORS["text_primary"]
         elif status == "packing":
             v_txt = "⏳ Đang ghi"
-            v_color = "#f59e0b"
+            v_color = COLORS["warning"]
         else:
             v_txt = "0 video"
             v_color = COLORS["text_muted"]
@@ -968,7 +1053,8 @@ class AppWindow(ctk.CTk):
         btn_title = f"📁 Video ({v_count})" if v_count > 1 else "📁 Mở video"
         row_btn = ctk.CTkButton(
             btn_box, text=btn_title, font=FONTS["small_bold"],
-            width=80, height=28, fg_color="#0284c7", hover_color="#0369a1",
+            width=80, height=28, corner_radius=SIZES["border_radius"],
+            fg_color=COLORS["btn_folder"], hover_color=COLORS["btn_folder_hover"],
             command=lambda o=order, r=row: self._on_row_video_click(o, r)
         )
         row_btn.pack(side="left", padx=(0, PADDING["xs"]), pady=6)
@@ -979,7 +1065,8 @@ class AppWindow(ctk.CTk):
         )
         del_btn = ctk.CTkButton(
             btn_box, text="🗑️ Xóa", font=FONTS["small_bold"],
-            width=55, height=28, fg_color="#ef4444", hover_color="#dc2626",
+            width=55, height=28, corner_radius=SIZES["border_radius"],
+            fg_color=COLORS["error"], hover_color=COLORS["recording_pulse"],
             state="disabled" if is_order_live else "normal",
             command=lambda o=order: self._confirm_delete_order(o)
         )
@@ -1005,7 +1092,7 @@ class AppWindow(ctk.CTk):
         if row_widget and row_widget.winfo_exists():
             self._selected_row_widget = row_widget
             try:
-                row_widget.configure(fg_color="#334155")
+                row_widget.configure(fg_color=COLORS["border"])
             except Exception:
                 pass
 
@@ -1068,13 +1155,13 @@ class AppWindow(ctk.CTk):
                 details = "   •   ".join(v_parts)
                 self._order_video_status.configure(
                     text=f"✅ {len(video_files)} video sẵn sàng: {details}",
-                    text_color="#38bdf8"
+                    text_color=COLORS["accent_hover"]
                 )
             else:
                 if status == "packing":
                     self._order_video_status.configure(
                         text="⏳ Đơn hàng đang được ghi hình trực tiếp...",
-                        text_color="#fbbf24"
+                        text_color=COLORS["warning"]
                     )
                 else:
                     self._order_video_status.configure(
@@ -1170,13 +1257,15 @@ class AppWindow(ctk.CTk):
 
         ctk.CTkButton(
             btn_row, text="🗑️ Xóa vĩnh viễn", font=FONTS["body_bold"],
-            height=36, fg_color="#ef4444", hover_color="#dc2626", text_color="#ffffff",
+            height=36, corner_radius=SIZES["border_radius"],
+            fg_color=COLORS["error"], hover_color=COLORS["recording_pulse"], text_color="#ffffff",
             command=_do_delete
         ).pack(side="left", fill="x", expand=True, padx=(0, PADDING["sm"]))
 
         ctk.CTkButton(
             btn_row, text="✕ Hủy bỏ", font=FONTS["body"],
-            height=36, fg_color="#334155", hover_color="#475569", text_color="#ffffff",
+            height=36, corner_radius=SIZES["border_radius"],
+            fg_color=COLORS["border"], hover_color=COLORS["border_light"], text_color=COLORS["text_primary"],
             command=dialog.destroy
         ).pack(side="left", fill="x", expand=True)
 
@@ -1213,29 +1302,46 @@ class AppWindow(ctk.CTk):
         videos = self._locate_order_video_files(order)
         if not videos:
             return
+        selected_label = self._export_preset_var.get() if hasattr(self, "_export_preset_var") else EXPORT_PRESETS["shopee_30"]["label"]
+        preset_key = EXPORT_LABEL_TO_PRESET.get(selected_label, "shopee_30")
+
         self._zalo_export_btn.configure(state="disabled")
-        self._order_video_status.configure(text=f"⏳ Đang xuất {len(videos)} video H.264 để gửi Zalo...", text_color=COLORS["warning"])
-        output_dir = os.path.join(self.config.base_dir, "ZaloExports")
+        self._order_video_status.configure(
+            text=f"⏳ Đang xuất {len(videos)} video chuẩn {selected_label}...",
+            text_color=COLORS["warning"],
+        )
+        output_dir = os.path.join(self.config.base_dir, "VideoExports")
 
         def worker():
             try:
-                exported = [export_for_zalo(v["filepath"], output_dir) for v in videos]
-                def done():
-                    self._zalo_export_btn.configure(state="normal")
-                    self._order_video_status.configure(
-                        text=f"✅ Đã xuất {len(exported)} video H.264 vào thư mục ZaloExports. File gốc được giữ nguyên.",
-                        text_color=COLORS["success"]
-                    )
-                    subprocess.Popen(["explorer", "/select,", exported[0]])
-                self.after(0, done)
-            except Exception as exc:
-                log.error(f"[Zalo] Export error: {exc}")
-                def failed(message=str(exc)):
-                    self._zalo_export_btn.configure(state="normal")
-                    self._order_video_status.configure(text=f"❌ Xuất video thất bại: {message}", text_color=COLORS["error"])
-                self.after(0, failed)
+                exported = [export_for_platform(v["filepath"], output_dir, preset_key) for v in videos]
 
-        threading.Thread(target=worker, daemon=True, name="ZaloExportWorker").start()
+                def done():
+                    if hasattr(self, "_zalo_export_btn") and self._zalo_export_btn.winfo_exists():
+                        self._zalo_export_btn.configure(state="normal")
+                    if hasattr(self, "_order_video_status") and self._order_video_status.winfo_exists():
+                        self._order_video_status.configure(
+                            text=f"✅ Đã xuất {len(exported)} video ({selected_label}) vào VideoExports. File gốc được giữ nguyên.",
+                            text_color=COLORS["success"],
+                        )
+                    subprocess.Popen(["explorer", "/select,", exported[0]])
+
+                self._safe_dispatch(done)
+            except Exception as exc:
+                log.error(f"[Export] Video export error: {exc}")
+
+                def failed(message=str(exc)):
+                    if hasattr(self, "_zalo_export_btn") and self._zalo_export_btn.winfo_exists():
+                        self._zalo_export_btn.configure(state="normal")
+                    if hasattr(self, "_order_video_status") and self._order_video_status.winfo_exists():
+                        self._order_video_status.configure(
+                            text=f"❌ Xuất video thất bại: {message}",
+                            text_color=COLORS["error"],
+                        )
+
+                self._safe_dispatch(failed)
+
+        threading.Thread(target=worker, daemon=True, name="VideoExportWorker").start()
 
     def _locate_order_video_files(self, order) -> list:
         """
@@ -1373,22 +1479,35 @@ class AppWindow(ctk.CTk):
         # Summary cards
         summary = ctk.CTkFrame(page, fg_color="transparent")
         summary.pack(fill="x", pady=(0, PADDING["md"]))
+        border_w = SIZES.get("card_border_width", 0)
 
-        total_card = ctk.CTkFrame(summary, fg_color=COLORS["bg_card"], corner_radius=SIZES["border_radius"])
+        total_card = ctk.CTkFrame(
+            summary, fg_color=COLORS["bg_card"],
+            corner_radius=SIZES["border_radius"],
+            border_width=border_w, border_color=COLORS["border"]
+        )
         total_card.pack(side="left", fill="x", expand=True, padx=(0, PADDING["sm"]))
         ctk.CTkLabel(total_card, text=str(total), font=("Segoe UI", 36, "bold"), text_color=COLORS["accent"]).pack(padx=PADDING["lg"], pady=(PADDING["md"], 0))
         ctk.CTkLabel(total_card, text=self._t("stats.today"), font=FONTS["body"], text_color=COLORS["text_secondary"]).pack(padx=PADDING["lg"], pady=(0, PADDING["md"]))
 
         # Per station cards
         for stat in stats:
-            card = ctk.CTkFrame(summary, fg_color=COLORS["bg_card"], corner_radius=SIZES["border_radius"])
+            card = ctk.CTkFrame(
+                summary, fg_color=COLORS["bg_card"],
+                corner_radius=SIZES["border_radius"],
+                border_width=border_w, border_color=COLORS["border"]
+            )
             card.pack(side="left", fill="x", expand=True, padx=PADDING["xs"])
             ctk.CTkLabel(card, text=str(stat["count"]), font=("Segoe UI", 28, "bold"), text_color=COLORS["success"]).pack(padx=PADDING["md"], pady=(PADDING["md"], 0))
             avg = f"{stat['avg_seconds']:.0f}s" if stat["avg_seconds"] else "---"
             ctk.CTkLabel(card, text=f"Bàn {stat['scanner_id']} | TB: {avg}", font=FONTS["small"], text_color=COLORS["text_secondary"]).pack(padx=PADDING["md"], pady=(0, PADDING["md"]))
 
         # Hourly chart (text-based simple chart)
-        chart_card = ctk.CTkFrame(page, fg_color=COLORS["bg_card"], corner_radius=SIZES["border_radius"])
+        chart_card = ctk.CTkFrame(
+            page, fg_color=COLORS["bg_card"],
+            corner_radius=SIZES["border_radius"],
+            border_width=border_w, border_color=COLORS["border"]
+        )
         chart_card.pack(fill="both", expand=True)
         ctk.CTkLabel(chart_card, text=self._t("stats.hourly"), font=FONTS["body_bold"], text_color=COLORS["text_primary"]).pack(anchor="w", padx=PADDING["md"], pady=PADDING["sm"])
 
@@ -1401,43 +1520,64 @@ class AppWindow(ctk.CTk):
                 row.pack(fill="x", pady=1)
                 ctk.CTkLabel(row, text=f"{h['hour']:02d}:00", font=FONTS["mono"], text_color=COLORS["text_muted"], width=60).pack(side="left")
                 bar_width = max(5, int((h["count"] / max_count) * 300)) if max_count > 0 else 5
-                bar = ctk.CTkFrame(row, fg_color=COLORS["accent"], height=18, width=bar_width, corner_radius=4)
+                bar = ctk.CTkFrame(row, fg_color=COLORS["accent"], height=18, width=bar_width, corner_radius=SIZES["border_radius"])
                 bar.pack(side="left", padx=PADDING["xs"])
                 bar.pack_propagate(False)
                 ctk.CTkLabel(row, text=str(h["count"]), font=FONTS["small_bold"], text_color=COLORS["text_primary"]).pack(side="left", padx=PADDING["xs"])
         else:
             ctk.CTkLabel(chart_card, text=self._t("stats.no_data"), font=FONTS["body"], text_color=COLORS["text_muted"]).pack(pady=PADDING["xl"])
 
-        # Export button
+        # Export row + status feedback
+        export_bar = ctk.CTkFrame(page, fg_color="transparent")
+        export_bar.pack(fill="x", pady=PADDING["md"])
+
+        self._stats_export_status = ctk.CTkLabel(export_bar, text="", font=FONTS["small_bold"], text_color=COLORS["success"])
+        self._stats_export_status.pack(side="left")
+
         export_btn = ctk.CTkButton(
-            page, text=self._t("stats.export_excel"), font=FONTS["body_bold"],
-            height=40, fg_color=COLORS["success"], hover_color="#16a34a",
+            export_bar, text=self._t("stats.export_excel"), font=FONTS["body_bold"],
+            height=40, corner_radius=SIZES["border_radius"],
+            fg_color=COLORS["success"], hover_color=COLORS["btn_export_hover"],
             command=self._export_excel
         )
-        export_btn.pack(anchor="e", pady=PADDING["md"])
+        export_btn.pack(side="right")
         return page
 
     def _export_excel(self):
         try:
+            from tkinter import filedialog
             from openpyxl import Workbook
             today = date.today().isoformat()
+            filepath = filedialog.asksaveasfilename(
+                defaultextension=".xlsx",
+                initialdir=self.config.base_dir,
+                initialfile=f"ThongKe_{today}.xlsx",
+                filetypes=[("Excel Workbook", "*.xlsx")],
+            )
+            if not filepath:
+                return
             orders = self.db.get_orders_by_date(today)
             wb = Workbook()
             ws = wb.active
             ws.title = f"Đóng gói {today}"
             ws.append(["STT", "Mã vận đơn", "Bàn", "Bắt đầu", "Ngày xuất video", "Số video", "File video", "Trạng thái", "Người phụ trách"])
-            for i, o in enumerate(orders, 1):
+            for i, raw_o in enumerate(orders, 1):
+                o = dict(raw_o)
                 export_time = o.get("video_export_time") or o.get("end_time") or ""
                 v_count = o.get("video_count", 0)
                 v_files = o.get("video_filenames") or ""
                 ws.append([i, o["order_sn"], o["scanner_id"], o["start_time"], export_time, v_count, v_files, o["status"], o["operator"] or ""])
-            filepath = os.path.join(self.config.base_dir, f"ThongKe_{today}.xlsx")
             wb.save(filepath)
-            self._on_log(self._t("stats.export_success", file=filepath), 0)
+            msg = self._t("stats.export_success", file=filepath)
+            self._on_log(msg, 0)
+            if hasattr(self, "_stats_export_status") and self._stats_export_status.winfo_exists():
+                self._stats_export_status.configure(text=f"✅ {msg}", text_color=COLORS["success"])
         except ImportError:
             self._on_log("❌ Cần cài openpyxl: pip install openpyxl", 0)
         except Exception as e:
             self._on_log(f"❌ Export error: {e}", 0)
+            if hasattr(self, "_stats_export_status") and self._stats_export_status.winfo_exists():
+                self._stats_export_status.configure(text=f"❌ Lỗi xuất Excel: {e}", text_color=COLORS["error"])
 
     # ═══════════════════════════════════════════
     # SETTINGS PAGE
@@ -1448,8 +1588,13 @@ class AppWindow(ctk.CTk):
 
         ctk.CTkLabel(page, text=self._t("settings.title"), font=FONTS["heading"], text_color=COLORS["text_primary"]).pack(anchor="w", pady=(0, PADDING["md"]))
 
+        border_w = SIZES.get("card_border_width", 0)
+
         # ── Camera Quick Setup ──
-        setup_card = ctk.CTkFrame(page, fg_color=COLORS["bg_card"], corner_radius=SIZES["border_radius"])
+        setup_card = ctk.CTkFrame(
+            page, fg_color=COLORS["bg_card"], corner_radius=SIZES["border_radius"],
+            border_width=border_w, border_color=COLORS["border"]
+        )
         setup_card.pack(fill="x", pady=PADDING["sm"])
         ctk.CTkLabel(setup_card, text="🔌 Kết nối Camera nhanh", font=FONTS["body_bold"], text_color=COLORS["accent"]).pack(anchor="w", padx=PADDING["md"], pady=(PADDING["md"], PADDING["sm"]))
 
@@ -1461,19 +1606,22 @@ class AppWindow(ctk.CTk):
 
         ctk.CTkButton(
             setup_btns, text="📱 Quét QR Camera", font=FONTS["body_bold"],
-            height=44, fg_color="#7c3aed", hover_color="#6d28d9",
+            height=44, corner_radius=SIZES["border_radius"],
+            fg_color=COLORS["btn_qr"], hover_color=COLORS["btn_qr_hover"],
             command=self._open_qr_scan_dialog
         ).pack(side="left", fill="x", expand=True, padx=(0, PADDING["xs"]))
 
         ctk.CTkButton(
             setup_btns, text="🔍 Dò Camera", font=FONTS["body_bold"],
-            height=44, fg_color="#0891b2", hover_color="#0e7490",
+            height=44, corner_radius=SIZES["border_radius"],
+            fg_color=COLORS["btn_scan_net"], hover_color=COLORS["btn_scan_net_hover"],
             command=self._open_network_scan_dialog
         ).pack(side="left", fill="x", expand=True, padx=(PADDING["xs"], PADDING["xs"]))
 
         ctk.CTkButton(
             setup_btns, text="⚡ Kích hoạt Imou (37777)", font=FONTS["body_bold"],
-            height=44, fg_color="#ea580c", hover_color="#c2410c",
+            height=44, corner_radius=SIZES["border_radius"],
+            fg_color=COLORS["btn_imou"], hover_color=COLORS["btn_imou_hover"],
             command=self._open_imou_sync_dialog
         ).pack(side="left", fill="x", expand=True, padx=(0, 0))
 
@@ -1485,7 +1633,10 @@ class AppWindow(ctk.CTk):
         self._setup_status.pack(anchor="w", pady=(PADDING["xs"], 0))
 
         # ── Camera Settings (Dynamic) ──
-        cam_card = ctk.CTkFrame(page, fg_color=COLORS["bg_card"], corner_radius=SIZES["border_radius"])
+        cam_card = ctk.CTkFrame(
+            page, fg_color=COLORS["bg_card"], corner_radius=SIZES["border_radius"],
+            border_width=border_w, border_color=COLORS["border"]
+        )
         cam_card.pack(fill="x", pady=PADDING["sm"])
         ctk.CTkLabel(cam_card, text="📷 " + self._t("settings.tab_camera") + " (Danh sách Camera)", font=FONTS["body_bold"], text_color=COLORS["accent"]).pack(anchor="w", padx=PADDING["md"], pady=(PADDING["md"], PADDING["sm"]))
 
@@ -1504,7 +1655,8 @@ class AppWindow(ctk.CTk):
 
         ctk.CTkButton(
             cam_btn_bar, text="➕ Thêm Camera", font=FONTS["small_bold"],
-            height=34, fg_color="#0d9488", hover_color="#0f766e",
+            height=34, corner_radius=SIZES["border_radius"],
+            fg_color=COLORS["btn_add"], hover_color=COLORS["btn_add_hover"],
             command=self._add_camera_row
         ).pack(side="left")
 
@@ -1516,7 +1668,10 @@ class AppWindow(ctk.CTk):
         ).pack(anchor="w", pady=(2, 0))
 
         # ── Video Settings ──
-        vid_card = ctk.CTkFrame(page, fg_color=COLORS["bg_card"], corner_radius=SIZES["border_radius"])
+        vid_card = ctk.CTkFrame(
+            page, fg_color=COLORS["bg_card"], corner_radius=SIZES["border_radius"],
+            border_width=border_w, border_color=COLORS["border"]
+        )
         vid_card.pack(fill="x", pady=PADDING["sm"])
         ctk.CTkLabel(vid_card, text="🎬 " + self._t("settings.tab_video"), font=FONTS["body_bold"], text_color=COLORS["accent"]).pack(anchor="w", padx=PADDING["md"], pady=(PADDING["md"], PADDING["sm"]))
 
@@ -1562,7 +1717,10 @@ class AppWindow(ctk.CTk):
         ).pack(anchor="w", pady=(2, 0))
 
         # ── System Settings ──
-        sys_card = ctk.CTkFrame(page, fg_color=COLORS["bg_card"], corner_radius=SIZES["border_radius"])
+        sys_card = ctk.CTkFrame(
+            page, fg_color=COLORS["bg_card"], corner_radius=SIZES["border_radius"],
+            border_width=border_w, border_color=COLORS["border"]
+        )
         sys_card.pack(fill="x", pady=PADDING["sm"])
         ctk.CTkLabel(sys_card, text="💻 " + self._t("settings.tab_system"), font=FONTS["body_bold"], text_color=COLORS["accent"]).pack(anchor="w", padx=PADDING["md"], pady=(PADDING["md"], PADDING["sm"]))
 
@@ -1579,8 +1737,57 @@ class AppWindow(ctk.CTk):
         self._startup_var = ctk.BooleanVar(value=is_startup_enabled())
         ctk.CTkCheckBox(sys_inner, text=self._t("settings.startup_windows"), variable=self._startup_var, font=FONTS["body"], text_color=COLORS["text_primary"]).pack(anchor="w", pady=PADDING["xs"])
 
+        # ── Theme Switcher Card (Giữ nguyên 100% bố cục, tùy chọn thử giao diện mới) ──
+        current_theme_key = get_current_theme()
+        current_theme_label = THEMES.get(current_theme_key, THEMES["classic"])["label"]
+        toggle_btn_text = (
+            "🎨 Đổi sang Giao diện Mới (Obsidian Pro)"
+            if current_theme_key == "classic"
+            else "↩️ Quay về Giao diện Cũ (Mặc định)"
+        )
+
+        theme_card = ctk.CTkFrame(
+            page, fg_color=COLORS["bg_card"], corner_radius=SIZES["border_radius"],
+            border_width=border_w, border_color=COLORS["border"]
+        )
+        theme_card.pack(fill="x", pady=PADDING["sm"])
+
+        theme_header = ctk.CTkFrame(theme_card, fg_color="transparent")
+        theme_header.pack(fill="x", padx=PADDING["md"], pady=(PADDING["md"], PADDING["xs"]))
+        ctk.CTkLabel(
+            theme_header, text="🎨 Giao diện hiển thị (Thử nghiệm)",
+            font=FONTS["body_bold"], text_color=COLORS["accent"]
+        ).pack(side="left")
+        ctk.CTkLabel(
+            theme_header, text=f"Đang dùng: {current_theme_label}",
+            font=FONTS["small_bold"], text_color=COLORS["success"]
+        ).pack(side="right")
+
+        theme_inner = ctk.CTkFrame(theme_card, fg_color="transparent")
+        theme_inner.pack(fill="x", padx=PADDING["md"], pady=(0, PADDING["md"]))
+        ctk.CTkLabel(
+            theme_inner,
+            text="💡 Giữ nguyên 100% bố cục quen thuộc. Bạn có thể bật thử giao diện mới vài ngày và quay lại giao diện cũ bất cứ lúc nào.",
+            font=FONTS["small"], text_color=COLORS["text_secondary"], justify="left", wraplength=680
+        ).pack(anchor="w", pady=(0, PADDING["sm"]))
+
+        self._theme_switch_btn = ctk.CTkButton(
+            theme_inner,
+            text=toggle_btn_text,
+            font=FONTS["body_bold"],
+            height=38,
+            corner_radius=SIZES["border_radius"],
+            fg_color=COLORS["accent"],
+            hover_color=COLORS["accent_hover"],
+            command=self._toggle_ui_theme,
+        )
+        self._theme_switch_btn.pack(anchor="w")
+
         # ── PIN Protection Card ──
-        pin_card = ctk.CTkFrame(page, fg_color=COLORS["bg_card"], corner_radius=SIZES["border_radius"])
+        pin_card = ctk.CTkFrame(
+            page, fg_color=COLORS["bg_card"], corner_radius=SIZES["border_radius"],
+            border_width=border_w, border_color=COLORS["border"]
+        )
         pin_card.pack(fill="x", pady=PADDING["sm"])
         pin_header = ctk.CTkFrame(pin_card, fg_color="transparent")
         pin_header.pack(fill="x", padx=PADDING["md"], pady=(PADDING["md"], PADDING["sm"]))
@@ -1626,13 +1833,17 @@ class AppWindow(ctk.CTk):
 
         ctk.CTkButton(
             pin_grid, text="Cập nhật PIN", font=FONTS["small_bold"],
-            width=110, height=32, fg_color="#2563eb", hover_color="#1d4ed8",
+            width=110, height=32, corner_radius=SIZES["border_radius"],
+            fg_color=COLORS["btn_primary_alt"], hover_color=COLORS["btn_primary_alt_hover"],
             command=_update_pin_action
         ).pack(side="left")
 
         # ── Software Update Card (GitHub) ──
         from core.updater import CURRENT_VERSION
-        upd_card = ctk.CTkFrame(page, fg_color=COLORS["bg_card"], corner_radius=SIZES["border_radius"])
+        upd_card = ctk.CTkFrame(
+            page, fg_color=COLORS["bg_card"], corner_radius=SIZES["border_radius"],
+            border_width=border_w, border_color=COLORS["border"]
+        )
         upd_card.pack(fill="x", pady=PADDING["sm"])
 
         upd_header = ctk.CTkFrame(upd_card, fg_color="transparent")
@@ -1675,8 +1886,9 @@ class AppWindow(ctk.CTk):
             font=FONTS["small_bold"],
             width=160,
             height=34,
-            fg_color="#2563eb",
-            hover_color="#1d4ed8",
+            corner_radius=SIZES["border_radius"],
+            fg_color=COLORS["btn_primary_alt"],
+            hover_color=COLORS["btn_primary_alt_hover"],
             command=self._on_check_for_update,
         )
         self._check_update_btn.pack(side="left", padx=(0, PADDING["sm"]))
@@ -1687,8 +1899,9 @@ class AppWindow(ctk.CTk):
             font=FONTS["small_bold"],
             width=190,
             height=34,
+            corner_radius=SIZES["border_radius"],
             fg_color=COLORS["success"],
-            hover_color="#15803d",
+            hover_color=COLORS["btn_export_hover"],
             command=self._on_apply_update,
         )
         self._pending_update_info = None
@@ -1696,10 +1909,39 @@ class AppWindow(ctk.CTk):
         # Save button
         ctk.CTkButton(
             page, text=self._t("settings.save"), font=FONTS["body_bold"],
-            height=44, fg_color=COLORS["accent"], hover_color=COLORS["accent_hover"],
+            height=44, corner_radius=SIZES["border_radius"],
+            fg_color=COLORS["accent"], hover_color=COLORS["accent_hover"],
             command=self._save_settings
         ).pack(fill="x", pady=PADDING["md"])
         return page
+
+    def _toggle_ui_theme(self):
+        """Toggle between 'classic' and 'industrial_carbon' themes live without touching camera/order pipelines."""
+        next_theme = "industrial_carbon" if get_current_theme() == "classic" else "classic"
+        self.config.set("ui_theme", next_theme)
+        apply_theme(next_theme)
+
+        for attr in ("_main_frame", "_status_bar"):
+            widget = getattr(self, attr, None)
+            if widget is not None and widget.winfo_exists():
+                widget.destroy()
+
+        self._page_frames.clear()
+        self._cam_labels.clear()
+        self._cam_badges.clear()
+        self._cam_entries = []
+        self._camera_images.clear()
+        self._last_rendered_frame_id.clear()
+        self._cam_badge_state.clear()
+        self._last_status_cache.clear()
+        self._current_page = ""
+
+        self.configure(fg_color=COLORS["bg_primary"])
+        self._build_layout()
+        self._navigate("settings")
+        self._update_status_bar()
+        label = THEMES.get(next_theme, THEMES["classic"])["label"]
+        self._on_log(f"🎨 Đã đổi sang {label}", 0)
 
     def _render_camera_rows(self, cam_urls=None):
         """Render dynamic camera input rows."""
@@ -1747,7 +1989,8 @@ class AppWindow(ctk.CTk):
 
             ctk.CTkButton(
                 input_box, text="🔑 Mật khẩu", font=FONTS["small_bold"],
-                width=100, height=32, fg_color="#2563eb", hover_color="#1d4ed8",
+                width=100, height=32, corner_radius=SIZES["border_radius"],
+                fg_color=COLORS["btn_primary_alt"], hover_color=COLORS["btn_primary_alt_hover"],
                 command=lambda i=idx: self._open_edit_camera_password_dialog(i)
             ).pack(side="right")
 
@@ -2138,33 +2381,39 @@ class AppWindow(ctk.CTk):
             if not ip or not pwd:
                 qr_status.configure(text="⚠️ Cần nhập cả IP và Mật khẩu!", text_color=COLORS["warning"])
                 return
+            idx = _get_target_idx()
+            is_dual = bool(dual_lens_var.get())
             qr_status.configure(text="⏳ Đang bắt tay cổng 37777 (NetSDK)...", text_color=COLORS["warning"])
 
             def worker():
                 from core.dahua_sdk import DahuaNetSDK
                 sdk = DahuaNetSDK()
                 res = sdk.test_and_configure_camera(ip, pwd)
-                if res["success"]:
-                    idx = _get_target_idx()
-                    if dual_lens_var.get():
-                        self.set_camera_url(idx, res["rtsp_url_ch1"])
-                        self.set_camera_url(idx + 1, res["rtsp_url_ch2"])
-                        msg = f"Đã gán vào Cam {idx+1} và Cam {idx+2}"
+
+                def _apply_ui():
+                    if res["success"]:
+                        if is_dual:
+                            self.set_camera_url(idx, res["rtsp_url_ch1"])
+                            self.set_camera_url(idx + 1, res["rtsp_url_ch2"])
+                            msg = f"Đã gán vào Cam {idx+1} và Cam {idx+2}"
+                        else:
+                            self.set_camera_url(idx, res["rtsp_url_ch1"])
+                            msg = f"Đã gán vào Cam {idx+1}"
+                        if dialog.winfo_exists():
+                            qr_status.configure(text=f"✅ {res['message']} ({msg})", text_color=COLORS["success"])
+                            stop_scan()
                     else:
-                        self.set_camera_url(idx, res["rtsp_url_ch1"])
-                        msg = f"Đã gán vào Cam {idx+1}"
-                    dialog.after(0, lambda: (
-                        qr_status.configure(text=f"✅ {res['message']} ({msg})", text_color=COLORS["success"]),
-                        stop_scan()
-                    ))
-                else:
-                    dialog.after(0, lambda: qr_status.configure(text=f"{res['message']}", text_color=COLORS["error"]))
+                        if dialog.winfo_exists():
+                            qr_status.configure(text=f"{res['message']}", text_color=COLORS["error"])
+
+                self._safe_dispatch(_apply_ui)
 
             threading.Thread(target=worker, daemon=True).start()
 
         ctk.CTkButton(
             btn_frame, text="⚡ Kích hoạt Imou", font=FONTS["body_bold"],
-            height=40, fg_color="#ea580c", hover_color="#c2410c",
+            height=40, corner_radius=SIZES["border_radius"],
+            fg_color=COLORS["btn_imou"], hover_color=COLORS["btn_imou_hover"],
             command=sync_imou
         ).pack(side="left", fill="x", expand=True, padx=(0, PADDING["xs"]))
 
@@ -2380,7 +2629,8 @@ class AppWindow(ctk.CTk):
 
         scan_btn = ctk.CTkButton(
             btn_frame, text="🔍 Bắt đầu dò", font=FONTS["body_bold"],
-            height=40, fg_color="#0891b2", hover_color="#0e7490",
+            height=40, corner_radius=SIZES["border_radius"],
+            fg_color=COLORS["btn_scan_net"], hover_color=COLORS["btn_scan_net_hover"],
             command=start_discovery
         )
         scan_btn.pack(side="left", fill="x", expand=True, padx=(0, PADDING["xs"]))
@@ -2459,6 +2709,16 @@ class AppWindow(ctk.CTk):
                 status_label.configure(text="⚠️ Vui lòng nhập đầy đủ IP và Mật khẩu camera!", text_color=COLORS["warning"])
                 return
 
+            choice = target_cam_menu.get()
+            if choice == "➕ Thêm camera mới":
+                idx = len(self._cam_entries)
+            else:
+                try:
+                    idx = int(choice.replace("Cam ", "")) - 1
+                except ValueError:
+                    idx = 0
+            is_dual = bool(dual_lens_var.get())
+
             status_label.configure(text="⏳ Đang bắt tay camera qua NetSDK (cổng 37777)...", text_color=COLORS["warning"])
             sync_btn.configure(state="disabled")
 
@@ -2466,45 +2726,38 @@ class AppWindow(ctk.CTk):
                 from core.dahua_sdk import DahuaNetSDK
                 sdk = DahuaNetSDK()
                 res = sdk.test_and_configure_camera(ip, pwd)
-                if res["success"]:
-                    choice = target_cam_menu.get()
-                    if choice == "➕ Thêm camera mới":
-                        idx = len(self._cam_entries)
-                    else:
-                        try:
-                            idx = int(choice.replace("Cam ", "")) - 1
-                        except ValueError:
-                            idx = 0
 
-                    if dual_lens_var.get():
-                        self.set_camera_url(idx, res["rtsp_url_ch1"])
-                        self.set_camera_url(idx + 1, res["rtsp_url_ch2"])
-                        msg = f"Đã gán vào Cam {idx+1} và Cam {idx+2}"
+                def _apply_ui():
+                    if res["success"]:
+                        if is_dual:
+                            self.set_camera_url(idx, res["rtsp_url_ch1"])
+                            self.set_camera_url(idx + 1, res["rtsp_url_ch2"])
+                            msg = f"Đã gán vào Cam {idx+1} và Cam {idx+2}"
+                        else:
+                            self.set_camera_url(idx, res["rtsp_url_ch1"])
+                            msg = f"Đã gán vào Cam {idx+1}"
+                        if dialog.winfo_exists():
+                            status_label.configure(
+                                text=f"{res['message']}\n✅ {msg}",
+                                text_color=COLORS["success"]
+                            )
+                            sync_btn.configure(state="normal", text="✅ Thành công")
                     else:
-                        self.set_camera_url(idx, res["rtsp_url_ch1"])
-                        msg = f"Đã gán vào Cam {idx+1}"
+                        if dialog.winfo_exists():
+                            status_label.configure(
+                                text=f"{res['message']}",
+                                text_color=COLORS["error"]
+                            )
+                            sync_btn.configure(state="normal", text="⚡ Thử lại")
 
-                    dialog.after(0, lambda: (
-                        status_label.configure(
-                            text=f"{res['message']}\n✅ {msg}",
-                            text_color=COLORS["success"]
-                        ),
-                        sync_btn.configure(state="normal", text="✅ Thành công")
-                    ))
-                else:
-                    dialog.after(0, lambda: (
-                        status_label.configure(
-                            text=f"{res['message']}",
-                            text_color=COLORS["error"]
-                        ),
-                        sync_btn.configure(state="normal", text="⚡ Thử lại")
-                    ))
+                self._safe_dispatch(_apply_ui)
 
             threading.Thread(target=worker, daemon=True).start()
 
         sync_btn = ctk.CTkButton(
             btn_frame, text="⚡ Kết nối & Kích hoạt", font=FONTS["body_bold"],
-            height=40, fg_color="#ea580c", hover_color="#c2410c",
+            height=40, corner_radius=SIZES["border_radius"],
+            fg_color=COLORS["btn_imou"], hover_color=COLORS["btn_imou_hover"],
             command=start_sync
         )
         sync_btn.pack(side="left", fill="x", expand=True, padx=(0, PADDING["xs"]))
@@ -2535,8 +2788,9 @@ class AppWindow(ctk.CTk):
         self.camera_mgr.start_all()
 
     def _record_camera_frame(self, frame, channel: int):
-        """Queue camera frames for recording independently of UI rendering."""
+        """Buffer pre-roll frames and queue live frames for recording independently of UI rendering."""
         try:
+            self.recorder.feed_live_frame(channel, frame)
             active = self.order_mgr.get_active_order(1)
             if active:
                 self.recorder.write_frame(active["order_sn"], frame, channel)
@@ -2603,15 +2857,19 @@ class AppWindow(ctk.CTk):
             if not label or not badge:
                 continue
 
-            if frame is not None:
+            if frame is not None and self.camera_mgr.is_connected(key):
                 # 0ms duplicate frame skip: if this frame was already drawn to UI, skip 100% of CV calculations
                 if frame_id == self._last_rendered_frame_id.get(key, -1):
                     continue
                 self._last_rendered_frame_id[key] = frame_id
 
                 try:
-                    display_width = max(160, label.winfo_width() - 10)
-                    display_height = max(120, label.winfo_height() - 10)
+                    try:
+                        dpi_scale = float(self._get_widget_scaling()) or 1.0
+                    except Exception:
+                        dpi_scale = 1.0
+                    display_width = max(160, int((label.winfo_width() - 10) / dpi_scale))
+                    display_height = max(120, int((label.winfo_height() - 10) / dpi_scale))
                     h, w = frame.shape[:2]
                     scale = min(display_width / w, display_height / h)
                     new_w, new_h = max(1, int(w * scale)), max(1, int(h * scale))
@@ -2630,16 +2888,22 @@ class AppWindow(ctk.CTk):
                         self._camera_images[key] = photo
                         self._camera_images[f"{key}_size"] = (new_w, new_h)
 
-                        # Update badge color ONLY when status transitions
+                        # Update badge ONLY when status transitions
                         if self._cam_badge_state.get(key) != "connected":
-                            badge.configure(text_color=COLORS["success"])
+                            badge.configure(text=self._t("camera.live"), text_color=COLORS["success"])
                             self._cam_badge_state[key] = "connected"
                 except Exception:
                     pass
             else:
                 if not self.camera_mgr.is_connected(key):
                     if self._cam_badge_state.get(key) != "disconnected":
-                        badge.configure(text_color=COLORS["text_muted"])
+                        badge.configure(text="MẤT KẾT NỐI", text_color=COLORS["error"])
+                        self._camera_images.pop(key, None)
+                        self._last_rendered_frame_id.pop(key, None)
+                        try:
+                            label.configure(image=None, text="⚠️ Mất kết nối camera...")
+                        except Exception:
+                            pass
                         self._cam_badge_state[key] = "disconnected"
 
     def _update_status_bar(self):
@@ -2651,12 +2915,15 @@ class AppWindow(ctk.CTk):
         if total_cams == 0:
             cam_status = self._t("status.camera_off")
             cam_color = COLORS["text_muted"]
-        elif len(connected_cams) > 0:
+        elif len(connected_cams) == total_cams:
             cam_status = f"Đã kết nối {len(connected_cams)}/{total_cams} Cam"
             cam_color = COLORS["success"]
+        elif len(connected_cams) > 0:
+            cam_status = f"Đã kết nối {len(connected_cams)}/{total_cams} Cam"
+            cam_color = COLORS["warning"]
         else:
             cam_status = self._t("status.camera_off")
-            cam_color = COLORS["text_muted"]
+            cam_color = COLORS["error"]
 
         status_text = f"📷 {cam_status}"
         if self._last_status_cache.get("status_bar") != (status_text, cam_color):
@@ -2664,8 +2931,10 @@ class AppWindow(ctk.CTk):
             self._last_status_cache["status_bar"] = (status_text, cam_color)
 
         orders_text = self._t("status.orders_today", count=count)
-        disk_free = self.recorder.get_disk_free_gb() if hasattr(self, "recorder") else 999.0
-        if disk_free < 2.0:
+        disk_free = self.recorder.get_disk_free_gb() if hasattr(self, "recorder") else -1.0
+        if disk_free < 0:
+            disk_str = "  |  ⚠️ Ổ đĩa: Không truy cập được"
+        elif disk_free < 2.0:
             disk_str = f"  |  ⚠️ Ổ đĩa: Còn {disk_free:.1f} GB"
         else:
             disk_str = f"  |  💾 Ổ đĩa trống: {disk_free:.1f} GB"
@@ -2912,6 +3181,7 @@ class AppWindow(ctk.CTk):
                 try:
                     self._log_text.configure(state="normal")
                     self._log_text.insert("0.0", entry + "\n")
+                    self._log_text.delete("201.0", "end")
                     self._log_text.configure(state="disabled")
                 except Exception:
                     pass

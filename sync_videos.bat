@@ -5,6 +5,10 @@ cd /d "%~dp0"
 echo ==================================================
 echo  PACKSTATION - KHÔI PHỤC VÀ ĐỒNG BỘ VIDEO TỪ THƯ MỤC
 echo ==================================================
-python sync_videos.py
+if exist "%~dp0PackStation.exe" (
+    "%~dp0PackStation.exe" --sync-videos
+) else (
+    python "%~dp0sync_videos.py"
+)
 echo.
 pause

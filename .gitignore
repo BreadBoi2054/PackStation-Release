@@ -11,20 +11,26 @@ dist/
 # Logs
 logs/
 *.log
+*.log.*
 
-# Video recordings (Sensitive customer/order packaging data)
+# Video recordings & exports (Sensitive customer/order packaging data)
 Videos/
 videos/
+ZaloExports/
+VideoExports/
 *.mp4
+*.part.mp4
 *.avi
 *.mkv
 
-# SQLite Databases & WAL/SHM files
+# SQLite Databases, Backups & WAL/SHM files
 *.db
 *.db-wal
 *.db-shm
 *.sqlite
 *.sqlite3
+backups/
+*.backup_*
 
 # Local runtime & sensitive configuration
 packstation-config.json

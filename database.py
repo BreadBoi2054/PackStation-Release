@@ -288,12 +288,12 @@ class Database:
         with self._lock:
             if scanner_id:
                 row = self.conn.execute(
-                    "SELECT COUNT(*) as cnt FROM orders WHERE start_time >= ? AND start_time <= ? AND scanner_id=?",
+                    "SELECT COUNT(*) as cnt FROM orders WHERE start_time >= ? AND start_time <= ? AND scanner_id=? AND status != 'cancelled'",
                     (t_start, t_end, scanner_id),
                 ).fetchone()
             else:
                 row = self.conn.execute(
-                    "SELECT COUNT(*) as cnt FROM orders WHERE start_time >= ? AND start_time <= ?",
+                    "SELECT COUNT(*) as cnt FROM orders WHERE start_time >= ? AND start_time <= ? AND status != 'cancelled'",
                     (t_start, t_end),
                 ).fetchone()
             return row["cnt"] if row else 0
@@ -321,7 +321,7 @@ class Database:
                           AVG(CASE WHEN end_time IS NOT NULL
                               THEN (julianday(end_time) - julianday(start_time)) * 86400
                               ELSE NULL END) as avg_seconds
-                   FROM orders WHERE start_time >= ? AND start_time <= ?
+                   FROM orders WHERE start_time >= ? AND start_time <= ? AND status != 'cancelled'
                    GROUP BY scanner_id""",
                 (f"{date_str} 00:00:00", f"{date_str} 23:59:59"),
             ).fetchall()
@@ -331,7 +331,7 @@ class Database:
         with self._lock:
             return self.conn.execute(
                 """SELECT CAST(strftime('%H', start_time) AS INTEGER) as hour, COUNT(*) as count
-                   FROM orders WHERE start_time >= ? AND start_time <= ?
+                   FROM orders WHERE start_time >= ? AND start_time <= ? AND status != 'cancelled'
                    GROUP BY hour ORDER BY hour""",
                 (f"{date_str} 00:00:00", f"{date_str} 23:59:59"),
             ).fetchall()
@@ -458,8 +458,48 @@ class Database:
         # Pattern handles: ORDER_Cam1.mp4, ORDER_Cam2.mp4, ORDER_Cam1_Lan2.mp4, or ORDER.mp4
         pattern = re.compile(r"^(.*?)(?:_Cam(\d+))?(?:_Lan\d+)?\.mp4$", re.IGNORECASE)
 
+        # Perform filesystem walk OUTSIDE self._lock so UI queries never stall
+        discovered_files = []
+        for root, _, files in os.walk(video_dir):
+            folder_name = os.path.basename(root)
+            is_date_folder = len(folder_name) == 10 and folder_name.count("-") == 2
+            for fname in files:
+                fname_lower = fname.lower()
+                if not fname_lower.endswith(".mp4") or fname_lower.endswith((".part.mp4", ".tmp.mp4")):
+                    continue
+
+                total_files += 1
+                fp = os.path.join(root, fname)
+                norm_fp = os.path.normpath(fp).lower()
+
+                m = pattern.match(fname)
+                if not m:
+                    order_sn = os.path.splitext(fname)[0].strip()
+                    channel = 1
+                else:
+                    order_sn = m.group(1).strip()
+                    ch_str = m.group(2)
+                    channel = int(ch_str) if ch_str else 1
+
+                if not order_sn:
+                    continue
+
+                try:
+                    mtime = os.path.getmtime(fp)
+                    file_time = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S")
+                    file_size = os.path.getsize(fp)
+                except Exception:
+                    file_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    file_size = 0
+
+                order_date = folder_name if is_date_folder else file_time[:10]
+                start_time = file_time
+                if is_date_folder and not file_time.startswith(folder_name):
+                    start_time = f"{folder_name} 12:00:00"
+
+                discovered_files.append((norm_fp, fname, fp, order_sn, channel, file_size, file_time, order_date, start_time))
+
         with self._lock:
-            # Pre-cache existing (order_sn, date) -> id mapping so that orders on different dates are not merged
             existing_orders = {}
             for row in self.conn.execute("SELECT id, order_sn, substr(start_time, 1, 10) as o_date FROM orders").fetchall():
                 sn = row["order_sn"].strip()
@@ -469,70 +509,32 @@ class Database:
                 elif sn and sn not in existing_orders:
                     existing_orders[sn] = row["id"]
 
-            # Pre-cache existing video filepaths for 0ms duplicate check
             existing_videos = set()
             for row in self.conn.execute("SELECT filepath FROM videos").fetchall():
                 if row["filepath"]:
                     existing_videos.add(os.path.normpath(row["filepath"]).lower())
 
-            # Walk through video directory
-            for root, _, files in os.walk(video_dir):
-                for fname in files:
-                    if not fname.lower().endswith(".mp4"):
-                        continue
+            for norm_fp, fname, fp, order_sn, channel, file_size, file_time, order_date, start_time in discovered_files:
+                # Skip already-tracked videos BEFORE creating an order row so orphans are never spawned
+                if norm_fp in existing_videos:
+                    continue
 
-                    total_files += 1
-                    fp = os.path.join(root, fname)
-                    norm_fp = os.path.normpath(fp).lower()
+                order_id = existing_orders.get((order_sn, order_date))
+                if not order_id:
+                    c = self.conn.execute(
+                        "INSERT INTO orders (order_sn, scanner_id, start_time, end_time, status, operator) VALUES (?, ?, ?, ?, 'completed', 'sync')",
+                        (order_sn, 1, start_time, file_time),
+                    )
+                    order_id = c.lastrowid
+                    existing_orders[(order_sn, order_date)] = order_id
+                    orders_created += 1
 
-                    m = pattern.match(fname)
-                    if not m:
-                        order_sn = os.path.splitext(fname)[0].strip()
-                        channel = 1
-                    else:
-                        order_sn = m.group(1).strip()
-                        ch_str = m.group(2)
-                        channel = int(ch_str) if ch_str else 1
-
-                    if not order_sn:
-                        continue
-
-                    # Determine file date and size
-                    try:
-                        mtime = os.path.getmtime(fp)
-                        file_time = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S")
-                        file_size = os.path.getsize(fp)
-                    except Exception:
-                        file_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                        file_size = 0
-
-                    folder_name = os.path.basename(root)
-                    is_date_folder = len(folder_name) == 10 and folder_name.count("-") == 2
-                    order_date = folder_name if is_date_folder else file_time[:10]
-
-                    start_time = file_time
-                    if is_date_folder and not file_time.startswith(folder_name):
-                        start_time = f"{folder_name} 12:00:00"
-
-                    # 1. Ensure order exists for this specific (order_sn, order_date)
-                    order_id = existing_orders.get((order_sn, order_date))
-                    if not order_id:
-                        c = self.conn.execute(
-                            "INSERT INTO orders (order_sn, scanner_id, start_time, end_time, status, operator) VALUES (?, ?, ?, ?, 'completed', 'sync')",
-                            (order_sn, 1, start_time, file_time),
-                        )
-                        order_id = c.lastrowid
-                        existing_orders[(order_sn, order_date)] = order_id
-                        orders_created += 1
-
-                    # 2. Ensure video exists in videos table
-                    if norm_fp not in existing_videos:
-                        self.conn.execute(
-                            "INSERT INTO videos (order_id, filename, filepath, camera_channel, file_size, duration_seconds, created_at) VALUES (?, ?, ?, ?, ?, 0, ?)",
-                            (order_id, fname, fp, channel, file_size, file_time),
-                        )
-                        existing_videos.add(norm_fp)
-                        videos_linked += 1
+                self.conn.execute(
+                    "INSERT INTO videos (order_id, filename, filepath, camera_channel, file_size, duration_seconds, created_at) VALUES (?, ?, ?, ?, ?, 0, ?)",
+                    (order_id, fname, fp, channel, file_size, file_time),
+                )
+                existing_videos.add(norm_fp)
+                videos_linked += 1
 
             self.conn.commit()
 

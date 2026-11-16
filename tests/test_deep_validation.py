@@ -74,10 +74,16 @@ def run_tests():
         # End order with KETTHUC
         om.process_scan("KETTHUC", scanner_id=1)
 
-        # Verify dual-lens video files created
+        # Verify dual-lens video files created (wait for async FFmpeg remux .part.mp4 -> .mp4)
         today = time.strftime("%Y-%m-%d")
         file_ch1 = os.path.join(cfg.video_dir, today, f"{order_sn}_Cam1.mp4")
         file_ch2 = os.path.join(cfg.video_dir, today, f"{order_sn}_Cam2.mp4")
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and not (
+            os.path.exists(file_ch1) and os.path.exists(file_ch2)
+            and os.path.getsize(file_ch1) > 0 and os.path.getsize(file_ch2) > 0
+        ):
+            time.sleep(0.05)
 
         assert os.path.exists(file_ch1), f"Channel 1 video missing: {file_ch1}"
         assert os.path.exists(file_ch2), f"Channel 2 video missing: {file_ch2}"

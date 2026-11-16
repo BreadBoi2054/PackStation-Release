@@ -22,7 +22,7 @@ class OrderManager:
         self._active_orders: dict[int, dict] = {}  # scanner_id -> order info
         self._finishing_orders: dict[int, dict] = {}  # scanner_id -> order info (recording final 8s)
         self._last_scan_times: dict[int, float] = {}  # scanner_id -> timestamp of last scan
-        self.scan_cooldown_seconds: float = float(config.get("scan_cooldown_seconds", 6.0))
+        self.scan_cooldown_seconds: float = float(config.get("scan_cooldown_seconds", 1.2))
         self.end_delay_seconds: float = float(config.get("end_delay_seconds", 0.0))
         self._lock = threading.RLock()
         self.on_order_started: Optional[Callable] = None
@@ -69,44 +69,47 @@ class OrderManager:
         c_clean = re.sub(r'[^A-Z0-9]', '', c_upper)
 
         fc = self.config.data.get("function_codes", {})
-        end_prefix = self.config.get("end_code_prefix", "KETTHUC").upper()
-        cancel_prefix = self.config.get("cancel_code_prefix", "HUYDON").upper()
-        manual_prefix = self.config.get("manual_code_prefix", "DONTHUCONG").upper()
-        shift_prefix = self.config.get("shift_code_prefix", "SETCA").upper()
+        end_prefix = str(self.config.get("end_code_prefix", "KETTHUC") or "").strip().upper()
+        cancel_prefix = str(self.config.get("cancel_code_prefix", "HUYDON") or "").strip().upper()
+        manual_prefix = str(self.config.get("manual_code_prefix", "DONTHUCONG") or "").strip().upper()
+        shift_prefix = str(self.config.get("shift_code_prefix", "SETCA") or "").strip().upper()
 
-        # 1. STOP / END CODES: Universal detection (STOP, ENDTIME, KETTHUC, DUNG, etc.)
+        # 1. STOP / END CODES (boundary-safe so orders like STOPWATCH999 are never misclassified)
         end_tokens = {
-            "STOP", "END", "ENDTIME", "KETTHUC", "KET_THUC", "DUNG", "DUNGQUAY",
-            "STOPORDER", "HOANTHANH", "TAMDUNG", "FINISH", "DONE"
+            "STOP", "END", "ENDTIME", "KETTHUC", "DUNG", "DUNGQUAY",
+            "STOPORDER", "HOANTHANH", "TAMDUNG", "FINISH", "DONE",
         }
-        if (c_clean in end_tokens or
-            c_upper.startswith(end_prefix) or
-            c_upper.startswith("STOP") or
-            c_upper.startswith("KETTHUC") or
-            c_upper.startswith("ENDTIME") or
-            c_upper == fc.get("end_order", "END").upper()):
+        end_prefixes = [re.escape(p) for p in dict.fromkeys([end_prefix, "KETTHUC", "STOP", "ENDTIME"]) if p]
+        if (
+            c_clean in end_tokens
+            or c_upper == str(fc.get("end_order", "END")).upper()
+            or (end_prefixes and re.match(rf"^({'|'.join(end_prefixes)})([_\-:\s].*)?$", c_upper))
+        ):
             return "end", c
 
-        # 2. CANCEL CODES: Universal detection (CANCEL, HUYDON, HUY, ABORT)
-        cancel_tokens = {"CANCEL", "HUY", "HUYDON", "HUY_DON", "ABORT", "DELETE"}
-        if (c_clean in cancel_tokens or
-            c_upper.startswith(cancel_prefix) or
-            c_upper.startswith("HUY") or
-            c_upper.startswith("CANCEL") or
-            c_upper == fc.get("cancel_order", "CANCEL").upper()):
+        # 2. CANCEL CODES (boundary-safe so tracking numbers like HUYHOANG123456 are never cancelled!)
+        cancel_tokens = {"CANCEL", "HUY", "HUYDON", "ABORT", "DELETE"}
+        cancel_prefixes = [re.escape(p) for p in dict.fromkeys([cancel_prefix, "HUYDON", "HUY_DON", "CANCEL"]) if p]
+        if (
+            c_clean in cancel_tokens
+            or c_upper == str(fc.get("cancel_order", "CANCEL")).upper()
+            or (cancel_prefixes and re.match(rf"^({'|'.join(cancel_prefixes)})([_\-:\s].*)?$", c_upper))
+        ):
             return "cancel", c
 
-        # 3. SHIFT / OPERATOR CODES: SETCA_Ca1, SHIFT_Huy, etc.
-        if c_upper.startswith(shift_prefix) or c_upper.startswith("SHIFT"):
-            prefix = shift_prefix if c_upper.startswith(shift_prefix) else "SHIFT"
+        # 3. SHIFT / OPERATOR CODES: SETCA_Ca1, SETCANguyen, SHIFT_Huy, etc.
+        if (shift_prefix and c_upper.startswith(shift_prefix)) or re.match(r"^SHIFT([_\-:\s].+|\d+.*)$", c_upper):
+            prefix = shift_prefix if (shift_prefix and c_upper.startswith(shift_prefix)) else "SHIFT"
             operator = c[len(prefix):].strip("_- :")
             return "shift", operator or "Ca 1"
 
         # 4. MANUAL ORDER CODES: DONTHUCONG, MANUAL
-        if (c_clean in {"MANUAL", "DONTHUCONG", "THUCONG"} or
-            c_upper.startswith(manual_prefix) or
-            c_upper.startswith("DONTHUCONG") or
-            c_upper == fc.get("manual_order", "MANUAL").upper()):
+        manual_prefixes = [re.escape(p) for p in dict.fromkeys([manual_prefix, "DONTHUCONG"]) if p]
+        if (
+            c_clean in {"MANUAL", "DONTHUCONG", "THUCONG"}
+            or c_upper == str(fc.get("manual_order", "MANUAL")).upper()
+            or (manual_prefixes and re.match(rf"^({'|'.join(manual_prefixes)})([_\-:\s].*)?$", c_upper))
+        ):
             return "manual", c
 
         return "none", ""

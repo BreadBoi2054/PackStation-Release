@@ -41,6 +41,9 @@ PROTECTED_NAMES = {
     "packstation-config.json",
     "videos",
     "logs",
+    "backups",
+    "zaloexports",
+    "videoexports",
     "temp_update",
     ".git",
 }
@@ -353,6 +356,61 @@ def backup_sqlite_database(db_path: str, backup_path: str) -> dict:
                     pass
 
 
+def prune_old_backups(target_dir: str, keep: int = 5) -> int:
+    """Keep only the newest `keep` DB backups and config backups across backups/ and legacy root."""
+    keep_n = max(1, int(keep))
+    db_re = re.compile(r"^(packstation_backup_\d+\.db|packstation\.db\.backup_\d+)$", re.IGNORECASE)
+    cfg_re = re.compile(r"^(packstation-config\.json\.backup_\d+|packstation-config_\d+\.json)$", re.IGNORECASE)
+    sidecar_re = re.compile(r"^(packstation_backup_\d+\.db)-(wal|shm)$", re.IGNORECASE)
+
+    search_dirs = [target_dir, os.path.join(target_dir, "backups")]
+    db_files = []
+    cfg_files = []
+
+    for folder in search_dirs:
+        if not os.path.isdir(folder):
+            continue
+        for fname in os.listdir(folder):
+            fpath = os.path.join(folder, fname)
+            if not os.path.isfile(fpath):
+                continue
+            if db_re.match(fname):
+                db_files.append(fpath)
+            elif cfg_re.match(fname):
+                cfg_files.append(fpath)
+
+    removed = 0
+    for group in (db_files, cfg_files):
+        group.sort(key=lambda p: (os.path.getmtime(p), p), reverse=True)
+        for old_path in group[keep_n:]:
+            try:
+                os.remove(old_path)
+                removed += 1
+                for suffix in ("-wal", "-shm"):
+                    if os.path.exists(old_path + suffix):
+                        os.remove(old_path + suffix)
+                        removed += 1
+            except Exception:
+                pass
+
+    # Clean up any orphaned -wal/-shm files whose backup .db no longer exists
+    for folder in search_dirs:
+        if not os.path.isdir(folder):
+            continue
+        for fname in os.listdir(folder):
+            m = sidecar_re.match(fname)
+            if m:
+                base_db = os.path.join(folder, m.group(1))
+                if not os.path.exists(base_db):
+                    try:
+                        os.remove(os.path.join(folder, fname))
+                        removed += 1
+                    except Exception:
+                        pass
+
+    return removed
+
+
 def backup_user_data(target_dir: str) -> dict:
     """Create verified safety backups of packstation.db (via SQLite Backup API) and packstation-config.json.
 
@@ -360,11 +418,13 @@ def backup_user_data(target_dir: str) -> dict:
     """
     backed_up = []
     ts = int(time.time())
+    backups_dir = os.path.join(target_dir, "backups")
+    os.makedirs(backups_dir, exist_ok=True)
 
     # 1. Online SQLite Backup (captures WAL accurately)
     db_src = os.path.join(target_dir, "packstation.db")
     if os.path.exists(db_src):
-        db_dst = os.path.join(target_dir, f"packstation.db.backup_{ts}")
+        db_dst = os.path.join(backups_dir, f"packstation_backup_{ts}.db")
         res = backup_sqlite_database(db_src, db_dst)
         if not res["ok"]:
             log.error(f"[Updater] ❌ {res['error']}")
@@ -376,7 +436,7 @@ def backup_user_data(target_dir: str) -> dict:
     # 2. Config JSON Backup
     cfg_src = os.path.join(target_dir, "packstation-config.json")
     if os.path.exists(cfg_src):
-        cfg_dst = os.path.join(target_dir, f"packstation-config.json.backup_{ts}")
+        cfg_dst = os.path.join(backups_dir, f"packstation-config_{ts}.json")
         try:
             shutil.copy2(cfg_src, cfg_dst)
             if not os.path.exists(cfg_dst) or os.path.getsize(cfg_dst) != os.path.getsize(cfg_src):
@@ -388,6 +448,7 @@ def backup_user_data(target_dir: str) -> dict:
             log.error(f"[Updater] ❌ {err_msg}")
             return {"ok": False, "backups": backed_up, "error": err_msg}
 
+    prune_old_backups(target_dir, keep=5)
     return {"ok": True, "backups": backed_up, "error": None}
 
 
@@ -721,7 +782,7 @@ if not "%WAIT_PID%"=="0" (
 echo [Updater] Dang tao ban sao luu phuc hoi rollback snapshot...
 if exist "%ROLLBACK_DIR%" rmdir /s /q "%ROLLBACK_DIR%" 2>nul
 mkdir "%ROLLBACK_DIR%" 2>nul
-robocopy "%TARGET_DIR%" "%ROLLBACK_DIR%" /E /R:3 /W:1 /XF "packstation.db" "packstation.db-wal" "packstation.db-shm" "packstation.db*.backup*" "packstation_backup*.db" "packstation-config.json" "packstation-config.json.backup*" "updater_apply.bat" /XD "Videos" "logs" "temp_update" ".git" >nul
+robocopy "%TARGET_DIR%" "%ROLLBACK_DIR%" /E /R:3 /W:1 /XF "packstation.db" "packstation.db-wal" "packstation.db-shm" "packstation.db*.backup*" "packstation_backup*.db" "packstation-config.json" "packstation-config.json.backup*" "updater_apply.bat" /XD "Videos" "logs" "backups" "ZaloExports" "VideoExports" "temp_update" ".git" >nul
 set "SNAP_RC=%ERRORLEVEL%"
 if !SNAP_RC! GEQ 8 (
     echo [Updater] ERROR: Khong the tao rollback snapshot - robocopy code !SNAP_RC! >> "%ERR_LOG%"
@@ -729,7 +790,7 @@ if !SNAP_RC! GEQ 8 (
 )
 
 echo [Updater] Dang sao chep ban cap nhat moi...
-robocopy "%STAGED_DIR%" "%TARGET_DIR%" /E /IS /IT /R:3 /W:1 /XF "packstation.db" "packstation.db-wal" "packstation.db-shm" "packstation.db*.backup*" "packstation_backup*.db" "packstation-config.json" "packstation-config.json.backup*" "updater_apply.bat" /XD "Videos" "logs" "temp_update" ".git" >nul
+robocopy "%STAGED_DIR%" "%TARGET_DIR%" /E /IS /IT /R:3 /W:1 /XF "packstation.db" "packstation.db-wal" "packstation.db-shm" "packstation.db*.backup*" "packstation_backup*.db" "packstation-config.json" "packstation-config.json.backup*" "updater_apply.bat" /XD "Videos" "logs" "backups" "ZaloExports" "VideoExports" "temp_update" ".git" >nul
 set "COPY_RC=%ERRORLEVEL%"
 if !COPY_RC! GEQ 8 (
     echo [Updater] ERROR: Sao chep ban cap nhat that bai - robocopy code !COPY_RC! >> "%ERR_LOG%"
@@ -752,7 +813,7 @@ if "%RESTART_APP%"=="1" (
 exit /b 0
 
 :rollback
-robocopy "%ROLLBACK_DIR%" "%TARGET_DIR%" /E /IS /IT /R:3 /W:1 /XF "packstation.db" "packstation.db-wal" "packstation.db-shm" "packstation.db*.backup*" "packstation_backup*.db" "packstation-config.json" "packstation-config.json.backup*" "updater_apply.bat" /XD "Videos" "logs" "temp_update" ".git" >nul
+robocopy "%ROLLBACK_DIR%" "%TARGET_DIR%" /E /IS /IT /R:3 /W:1 /XF "packstation.db" "packstation.db-wal" "packstation.db-shm" "packstation.db*.backup*" "packstation_backup*.db" "packstation-config.json" "packstation-config.json.backup*" "updater_apply.bat" /XD "Videos" "logs" "backups" "ZaloExports" "VideoExports" "temp_update" ".git" >nul
 echo [Updater] Da khoi phuc phien ban truoc tu rollback snapshot. Giu nguyen temp_update de kiem tra. >> "%ERR_LOG%"
 exit /b 3
 """

@@ -68,12 +68,10 @@ def build(dist_root: str = "", sync_to_c_packstation: bool = True):
         f"--distpath={actual_dist_root}",
         f"--workpath={work_root}",
         f"--specpath={actual_dist_root if dist_root else base_dir}",
-        f"--add-data={os.path.join(base_dir, 'i18n')};i18n",
-        f"--add-data={os.path.join(base_dir, 'audio')};audio",
-        f"--add-data={os.path.join(base_dir, 'assets')};assets",
-        f"--add-data={os.path.join(base_dir, 'libs')};libs",
         f"--add-binary={ffmpeg_exe};.",
         f"--version-file={version_file}",
+        "--exclude-module=imageio_ffmpeg",
+        "--exclude-module=lxml",
         "--hidden-import=pyzbar",
         "--hidden-import=zxingcpp",
         "--hidden-import=customtkinter",
@@ -140,11 +138,13 @@ def build(dist_root: str = "", sync_to_c_packstation: bool = True):
         if sync_to_c_packstation:
             target_portable = r"C:\PackStation"
             try:
+                from core.updater import backup_sqlite_database, prune_old_backups
                 target_db = os.path.join(target_portable, "packstation.db")
                 if os.path.exists(target_db):
                     import time
-                    from core.updater import backup_sqlite_database
-                    backup_db = os.path.join(target_portable, f"packstation_backup_{int(time.time())}.db")
+                    backups_dir = os.path.join(target_portable, "backups")
+                    os.makedirs(backups_dir, exist_ok=True)
+                    backup_db = os.path.join(backups_dir, f"packstation_backup_{int(time.time())}.db")
                     bak_res = backup_sqlite_database(target_db, backup_db)
                     ok_bak = bak_res.get("ok") if isinstance(bak_res, dict) else bool(bak_res)
                     err_bak = bak_res.get("error", "") if isinstance(bak_res, dict) else ""
@@ -152,6 +152,9 @@ def build(dist_root: str = "", sync_to_c_packstation: bool = True):
                         print(f"🛡️ Đã sao lưu Database hiện có (SQLite Backup API): {backup_db}")
                     else:
                         print(f"⚠️ Cảnh báo sao lưu Database: {err_bak}")
+                pruned = prune_old_backups(target_portable, keep=5)
+                if pruned:
+                    print(f"🧹 Đã dọn {pruned} file backup cũ trong {target_portable}")
 
                 protected_names = {
                     "packstation.db",
@@ -160,6 +163,9 @@ def build(dist_root: str = "", sync_to_c_packstation: bool = True):
                     "packstation-config.json",
                     "videos",
                     "logs",
+                    "backups",
+                    "zaloexports",
+                    "videoexports",
                 }
                 for item in os.listdir(dist_dir):
                     if item.lower() in protected_names or item.lower().startswith("packstation_backup"):
@@ -167,6 +173,8 @@ def build(dist_root: str = "", sync_to_c_packstation: bool = True):
                     s = os.path.join(dist_dir, item)
                     d = os.path.join(target_portable, item)
                     if os.path.isdir(s):
+                        if item == "_internal" and os.path.exists(d):
+                            shutil.rmtree(d, ignore_errors=True)
                         shutil.copytree(s, d, dirs_exist_ok=True)
                     else:
                         shutil.copy2(s, d)

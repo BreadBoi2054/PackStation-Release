@@ -55,7 +55,10 @@ class DahuaNetSDK:
 
     def _find_dll_dir(self) -> str:
         """Find the directory containing Dahua win64 DLLs."""
+        import sys
+        exe_dir = os.path.dirname(sys.executable)
         candidates = [
+            os.path.join(exe_dir, "libs", "win64"),
             os.path.join(os.path.dirname(os.path.dirname(__file__)), "libs", "win64"),
             os.path.join(os.path.dirname(__file__), "..", "libs", "win64"),
             os.path.join(os.getcwd(), "PackStation", "libs", "win64"),

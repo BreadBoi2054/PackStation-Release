@@ -7,11 +7,13 @@ import re
 
 DEFAULTS = {
     "language": "vi-VN",
+    "ui_theme": "classic",
     "app_name": "PackStation",
     "video_dir": "",
     "max_stations": 4,
     "active_stations": 1,
     "auto_record": True,
+    "pre_roll_seconds": 3,
     "video_retention_days": 30,
     "max_record_duration_minutes": 10,
     "duplicate_cooldown_seconds": 60,

@@ -1394,6 +1394,269 @@ class TestBarcodeFilter(unittest.TestCase):
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
+class TestPersonalWarehouseUpgrades(unittest.TestCase):
+    """Tests for personal camera-scanning, H.264/pre-roll/crash-safe MP4, theme switcher & backup pruning."""
+
+    def test_waybill_ranking_and_boundary_function_codes(self):
+        from core.barcode_scanner import BarcodeScanner
+        # Carrier tracking codes must outrank hub routing codes and EAN-13 product barcodes
+        self.assertGreater(
+            BarcodeScanner.score_barcode("SPXVN066035959139", "BarcodeFormat.Code128"),
+            BarcodeScanner.score_barcode("HN-SOC-02-A1", "BarcodeFormat.Code128"),
+        )
+        self.assertGreater(
+            BarcodeScanner.score_barcode("842725001122", "BarcodeFormat.Code128"),
+            BarcodeScanner.score_barcode("8934567890123", "BarcodeFormat.EAN13"),
+        )
+        self.assertEqual(BarcodeScanner.classify_function_code("HUYHOANG123456"), "none")
+        self.assertEqual(BarcodeScanner.classify_function_code("STOPWATCH999"), "none")
+        self.assertEqual(BarcodeScanner.classify_function_code("HUYDON"), "cancel")
+        self.assertEqual(BarcodeScanner.classify_function_code("KETTHUC"), "end")
+
+        tmp_dir = tempfile.mkdtemp()
+        try:
+            db = Database(os.path.join(tmp_dir, "test.db"))
+            db.initialize()
+            cfg = Config(tmp_dir)
+            om = OrderManager(db, cfg)
+            om.scan_cooldown_seconds = 0
+            om.end_delay_seconds = 0
+
+            # Order starting with HUY... must start normally and NOT trigger cancel
+            om.process_scan("HUYHOANG123456", scanner_id=1)
+            active = om.get_active_order(1)
+            self.assertIsNotNone(active)
+            self.assertEqual(active["order_sn"], "HUYHOANG123456")
+
+            # STOPWATCH999 while packing must be blocked as a duplicate/active collision, NOT end order
+            om.process_scan("STOPWATCH999", scanner_id=1)
+            self.assertIsNotNone(om.get_active_order(1))
+            self.assertEqual(om.get_active_order(1)["order_sn"], "HUYHOANG123456")
+
+            # Real HUYDON cancels properly
+            om.process_scan("HUYDON", scanner_id=1)
+            self.assertIsNone(om.get_active_order(1))
+            db.close()
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_state_aware_camera_scanner_filtering(self):
+        from core.barcode_scanner import BarcodeScanner
+        from unittest.mock import patch
+
+        packing_state = {"active": False}
+        emitted = []
+        scanner = BarcodeScanner(
+            on_code=lambda code, ctype: emitted.append((code, ctype)),
+            interval_ms=50,
+            is_packing=lambda: packing_state["active"],
+        )
+
+        # Simulate frame containing BOTH wooden-stand KETTHUC and a new box tracking code
+        frame_both = np.full((120, 160, 3), 20, dtype=np.uint8)
+        frame_second = np.full((120, 160, 3), 220, dtype=np.uint8)
+
+        with patch.object(
+            scanner,
+            "_detect",
+            return_value=[("KETTHUC", "BarcodeFormat.QRCode"), ("842725001122", "BarcodeFormat.Code128")],
+        ):
+            scanner.start()
+            # 1. Idle -> must ignore KETTHUC and emit parcel code 842725001122
+            scanner.set_frame(frame_both)
+            time.sleep(0.25)
+            self.assertIn(("842725001122", "BarcodeFormat.Code128"), emitted)
+            self.assertFalse(any(c[0] == "KETTHUC" for c in emitted))
+
+            # 2. Switch to packing -> feed changed frame -> must ignore parcel code and emit KETTHUC
+            emitted.clear()
+            packing_state["active"] = True
+            scanner.set_frame(frame_second)
+            time.sleep(0.25)
+            self.assertIn(("KETTHUC", "BarcodeFormat.QRCode"), emitted)
+            self.assertFalse(any(c[0] == "842725001122" for c in emitted))
+            scanner.stop()
+
+    def test_h264_recording_preroll_crash_recovery_and_platform_exports(self):
+        import cv2
+        import threading
+        import subprocess
+        from core.zalo_export import EXPORT_PRESETS, export_for_platform, _ffmpeg_path
+
+        tmp_dir = tempfile.mkdtemp()
+        try:
+            rec = VideoRecorder(tmp_dir, fps=10, resolution=(320, 240), pre_roll_seconds=2)
+
+            # 1. Feed 4 pre-roll frames before scan starts
+            for i in range(4):
+                frame = np.full((240, 320, 3), 40 + i * 30, dtype=np.uint8)
+                rec.feed_live_frame(1, frame)
+                time.sleep(0.095)
+
+            # 2. Start order & write 6 live frames
+            fp = rec.start_recording("SPXVN066035959139", channel=1)
+            for i in range(6):
+                frame = np.full((240, 320, 3), 160 + i * 10, dtype=np.uint8)
+                rec.write_frame("SPXVN066035959139", frame, channel=1)
+                time.sleep(0.095)
+
+            done_evt = threading.Event()
+            saved_info = {}
+
+            def _on_done(path, sz):
+                saved_info["path"] = path
+                saved_info["size"] = sz
+                done_evt.set()
+
+            rec.stop_recording("SPXVN066035959139", channel=1, on_complete=_on_done)
+            self.assertTrue(done_evt.wait(timeout=10), "Video finalize callback timed out")
+            self.assertTrue(os.path.isfile(fp))
+            self.assertGreater(saved_info.get("size", 0), 1024)
+
+            cap = cv2.VideoCapture(fp)
+            try:
+                self.assertTrue(cap.isOpened())
+                fourcc = int(cap.get(cv2.CAP_PROP_FOURCC))
+                fc_str = "".join(chr((fourcc >> (8 * i)) & 0xFF) for i in range(4)).lower()
+                self.assertIn(fc_str, ("avc1", "h264", "x264"))
+                self.assertGreaterEqual(cap.get(cv2.CAP_PROP_FRAME_COUNT), 6)
+            finally:
+                cap.release()
+
+            # 3. Export presets for Shopee, TikTok, and Zalo
+            export_dir = os.path.join(tmp_dir, "VideoExports")
+            for key in ("shopee_10", "shopee_30", "tiktok_50", "zalo_90"):
+                out_path = export_for_platform(fp, export_dir, preset_key=key)
+                self.assertTrue(os.path.isfile(out_path), f"Missing export for {key}")
+                self.assertGreater(os.path.getsize(out_path), 512)
+                self.assertLessEqual(os.path.getsize(out_path), int(EXPORT_PRESETS[key]["max_mb"] * 1024 * 1024))
+
+            # 4. Simulate power-cut .mp4.part.mp4 and verify recovery
+            crashed_dir = os.path.join(tmp_dir, "2026-11-16")
+            os.makedirs(crashed_dir, exist_ok=True)
+            part_file = os.path.join(crashed_dir, "POWERCUT_ORDER_Cam1.mp4.part.mp4")
+            final_recovered = os.path.join(crashed_dir, "POWERCUT_ORDER_Cam1.mp4")
+            ff = _ffmpeg_path()
+            proc = subprocess.Popen(
+                [
+                    ff, "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+                    "-f", "rawvideo", "-vcodec", "rawvideo", "-pix_fmt", "bgr24",
+                    "-s", "320x240", "-r", "10", "-i", "-",
+                    "-an", "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
+                    "-pix_fmt", "yuv420p", "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
+                    part_file,
+                ],
+                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            dummy = np.full((240, 320, 3), 100, dtype=np.uint8)
+            for _ in range(12):
+                proc.stdin.write(dummy.tobytes())
+            proc.stdin.close()
+            proc.wait(timeout=10)
+            self.assertGreater(os.path.getsize(part_file), 1024)
+
+            count = rec.recover_interrupted_recordings()
+            self.assertGreaterEqual(count, 1)
+            self.assertFalse(os.path.exists(part_file))
+            self.assertTrue(os.path.isfile(final_recovered))
+            cap2 = cv2.VideoCapture(final_recovered)
+            try:
+                self.assertTrue(cap2.isOpened())
+                self.assertGreaterEqual(cap2.get(cv2.CAP_PROP_FRAME_COUNT), 10)
+            finally:
+                cap2.release()
+
+            rec.stop_all()
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_theme_engine_and_design_spec(self):
+        from ui.theme import COLORS, SIZES, apply_theme, get_current_theme
+
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        self.assertTrue(os.path.isfile(os.path.join(repo_root, "DESIGN.md")))
+
+        try:
+            apply_theme("classic")
+            self.assertEqual(get_current_theme(), "classic")
+            self.assertEqual(COLORS["accent"], "#0ea5e9")
+            self.assertEqual(SIZES["border_radius"], 8)
+
+            apply_theme("industrial_carbon")
+            self.assertEqual(get_current_theme(), "industrial_carbon")
+            self.assertEqual(COLORS["accent"], "#F97316")
+            self.assertEqual(SIZES["border_radius"], 2)
+            self.assertNotIn("#7c3aed", COLORS.values())
+        finally:
+            apply_theme("classic")
+            self.assertEqual(COLORS["accent"], "#0ea5e9")
+            self.assertEqual(SIZES["border_radius"], 8)
+
+    def test_stats_exclude_cancelled_and_sync_avoids_orphan_orders(self):
+        from datetime import date
+
+        tmp_dir = tempfile.mkdtemp()
+        try:
+            db = Database(os.path.join(tmp_dir, "test.db"))
+            db.initialize()
+            oid1 = db.start_order("PACK_TODAY", 1)
+            oid2 = db.start_order("DONE_TODAY", 1)
+            db.end_order(oid2, "completed")
+            oid3 = db.start_order("CANCEL_TODAY", 1)
+            db.end_order(oid3, "cancelled")
+
+            self.assertEqual(db.get_today_count(), 2)
+            today_stats = db.get_stats_by_date(date.today().isoformat())
+            self.assertEqual(today_stats[0]["count"], 2)
+
+            # Already-tracked video under a date folder different from its order start_time must NOT create an orphan order
+            vid_dir = os.path.join(tmp_dir, "Videos")
+            other_date_dir = os.path.join(vid_dir, "2026-10-20")
+            os.makedirs(other_date_dir, exist_ok=True)
+            vpath = os.path.join(other_date_dir, "DONE_TODAY_Cam1.mp4")
+            with open(vpath, "wb") as f:
+                f.write(b"video_bytes")
+            db.add_video(oid2, "DONE_TODAY_Cam1.mp4", vpath, 1)
+
+            sync_res = db.sync_videos_from_folder(vid_dir)
+            self.assertEqual(sync_res["orders_created"], 0)
+            self.assertEqual(sync_res["videos_linked"], 0)
+            db.close()
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_prune_old_backups_keeps_newest_five(self):
+        from core.updater import prune_old_backups
+
+        tmp_dir = tempfile.mkdtemp()
+        try:
+            active_db = os.path.join(tmp_dir, "packstation.db")
+            with open(active_db, "wb") as f:
+                f.write(b"active")
+
+            backups_dir = os.path.join(tmp_dir, "backups")
+            os.makedirs(backups_dir, exist_ok=True)
+            created_paths = []
+            for idx in range(8):
+                ts = 1700000000 + idx * 10
+                p = os.path.join(backups_dir if idx >= 4 else tmp_dir, f"packstation_backup_{ts}.db")
+                with open(p, "wb") as f:
+                    f.write(b"bak")
+                with open(p + "-wal", "wb") as f:
+                    f.write(b"wal")
+                os.utime(p, (ts, ts))
+                created_paths.append(p)
+
+            removed = prune_old_backups(tmp_dir, keep=5)
+            self.assertGreaterEqual(removed, 6)  # 3 old .db + 3 old -wal
+            self.assertTrue(os.path.exists(active_db))
+            remaining_dbs = [p for p in created_paths if os.path.exists(p)]
+            self.assertEqual(len(remaining_dbs), 5)
+            self.assertEqual(remaining_dbs, created_paths[-5:])
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
 if __name__ == "__main__":
     print("=" * 60)
     print("🧪 PACKSTATION UNIT TEST SUITE")
